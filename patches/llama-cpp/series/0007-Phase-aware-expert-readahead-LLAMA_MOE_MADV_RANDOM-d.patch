@@ -1,0 +1,100 @@
+From 90d636f7ff0565a02b5de8ce5d30a0b02c63c855 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 17:43:08 +1300
+Subject: [PATCH 07/18] Phase-aware expert readahead:
+ LLAMA_MOE_MADV_RANDOM=decode + width-gated LLAMA_MOE_PREAD
+
+Node-log attribution (attrib-nodelog arm, 09-29): decode's moe-node walls sum
+to ~578 ms/token-equivalent, 90% of it io_ms - the miss-stream fault path at
+~0.5 GB/s effective IS the decode wall, not sched splits (~90 ms compute
+tails, 0.1 ms/node). The 09-28 MADV_RANDOM+PREAD recipe fixes exactly this
+but lost the cold benchmark because it also killed readahead for the prompt's
+one-pass stream. Now: =decode flips every registered expert mapping
+MADV_NORMAL<->MADV_RANDOM on prompt<->decode phase transitions (prompt-shaped
+= ids > 4), and PREAD engages only at decode/verify widths. Mixed workloads
+get exact reads when random and readahead when sequential, in one process.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 59 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 32401b6ce..da7c854bf 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1740,6 +1740,58 @@ static void * ggml_moe_fanout_worker(void * arg) {
+     return NULL;
+ }
+ 
++// LLAMA_MOE_MADV_RANDOM=decode: phase-aware readahead control. Prompt-shaped
++// ops (many id rows) keep MADV_NORMAL so the one-pass expert stream reads
++// sequentially at full readahead; decode/verify-shaped ops (ids <= 4) flip every
++// registered expert mapping to MADV_RANDOM so the random 2-3 slice misses per
++// node do not drag in neighbors (measured 09-28: pure-decode io 0.9 ->
++// 0.16 GiB/tok). Flips run on phase transitions only; every moe op registers
++// its tensor range the first time it is seen. LLAMA_MOE_PREAD is gated by the
++// same phase: exact-size pread for decode/verify widths, readahead-friendly
++// touch for prompts.
++static void ggml_moe_phase_update(const void * tensor_data, size_t nbytes, bool decode_phase) {
++    struct ggml_moe_phase_range { const void * p; size_t n; };
++    #define GGML_MOE_PHASE_MAX 512
++    static struct ggml_moe_phase_range ranges[GGML_MOE_PHASE_MAX];
++    static int ranges_n = 0;
++    static int phase = -1; // -1 unset, 0 prompt, 1 decode
++    static int mode = -1;  // -1 unset, 0 off, 2 decode-phase
++
++    if (mode == -1) {
++        const char * e = getenv("LLAMA_MOE_MADV_RANDOM");
++        mode = (e && e[0] == 'd') ? 2 : 0;
++    }
++    if (mode != 2) {
++        return;
++    }
++
++    const long pg = sysconf(_SC_PAGESIZE);
++    const void * base = (const void *) ((uintptr_t) tensor_data & ~((uintptr_t) pg - 1));
++    const size_t len = nbytes + ((const char *) tensor_data - (const char *) base);
++
++    bool registered = false;
++    for (int i = 0; i < ranges_n; ++i) {
++        if (ranges[i].p == base) {
++            registered = true;
++            break;
++        }
++    }
++    if (!registered && ranges_n < GGML_MOE_PHASE_MAX) {
++        ranges[ranges_n].p = base;
++        ranges[ranges_n].n = len;
++        ranges_n++;
++    }
++
++    const int want = decode_phase ? 1 : 0;
++    if (want == phase) {
++        return;
++    }
++    for (int i = 0; i < ranges_n; ++i) {
++        madvise((void *) ranges[i].p, ranges[i].n, want ? MADV_RANDOM : MADV_NORMAL);
++    }
++    phase = want;
++}
++
+ // ---- persistent async fanout pool -----------------------------------------
+ //
+ // One pool per process. Jobs enter a fixed ring; a ring slot is only reused
+@@ -2260,8 +2312,13 @@ static void ggml_compute_forward_mul_mat_id(
+                 moe_pread_on = (e && e[0] == '1');
+                 moe_pread_done = 1;
+             }
++            // exact-size pread only makes sense at decode/verify widths; at
++            // prompt widths it gives up readahead for the one-pass sequential
++            // stream (measured 09-28: loses the cold benchmark).
++            const bool moe_decode_phase = ids->ne[1] <= 4;
++            ggml_moe_phase_update(src0->data, ggml_nbytes(src0), moe_decode_phase);
+             const struct ggml_moe_pread_file * pf =
+-                moe_pread_on ? ggml_moe_pread_resolve(src0->data) : NULL;
++                (moe_pread_on && moe_decode_phase) ? ggml_moe_pread_resolve(src0->data) : NULL;
+             bool dispatched = false;
+             if (moe_fanout_async) {
+                 if (moe_node_log) {
+-- 
+2.55.0
+

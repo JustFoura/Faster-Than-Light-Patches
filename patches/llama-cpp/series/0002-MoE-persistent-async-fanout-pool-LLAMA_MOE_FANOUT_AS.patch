@@ -1,0 +1,463 @@
+From 63b8acad3ab3c0de636c0bce918bebd760f09040 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 15:26:42 +1300
+Subject: [PATCH 02/18] MoE: persistent async fanout pool
+ (LLAMA_MOE_FANOUT_ASYNC), GGML_MOE_NODE_LOG phase split,
+ GGML_VK_MOE_HOST_MAX_IDS routing knob
+
+- fanout: per-op spawn/join replaced by a persistent pool; ith==0 submits the
+  slice list and returns to compute (page-in overlaps compute within and
+  across nodes; ring backpressure keeps worker views consistent). Legacy
+  spawn/join path kept under LLAMA_MOE_FANOUT_ASYNC=0; forced legacy when
+  DONTNEED is on. Kills the ~24-thread create/join storm per mul_mat_id.
+- GGML_MOE_NODE_LOG=1: per-node submit/drain/node-wall timestamps exposing the
+  IO/compute phase split; revealed the warmup-only execution of the CPU kernel.
+- GGML_VK_MOE_HOST_MAX_IDS=N (default -1 = off): rejects wide-id mul_mat_id ops
+  whose weights sit in a GPU host buffer so the sched routes them to the CPU
+  kernel. Measured discovery behind it: on server prompt paths the sched runs
+  ffn_*_exps mul_mat_id on VULKAN (Vulkan_Host-mapped weights streamed through
+  uncontrolled GPU page faults, ~0.81 GB/s effective); all CPU-side MoE knobs
+  (fanout/DONTNEED/multi-RHS) never executed there. Probe data: request-phase
+  MUL_MAT_ID split 147 CPU / 141 Vulkan per graph. CAUTION: at ubatch 16384 the
+  CPU-side graph anon buffers OOM the 16 GB machine (kernel killed the desktop
+  session 3x); validate at ubatch <= 2048 first.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c         | 334 ++++++++++++++++++++++-----
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  20 ++
+ 2 files changed, 290 insertions(+), 64 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2df0047b8..32401b6ce 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1603,6 +1603,15 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+ // threads touch one byte per page of each slice the op will compute, forcing
+ // synchronous faults in N concurrent streams instead of relying on async
+ // readahead. 0 restores the passive MADV_WILLNEED kick.
++//
++// LLAMA_MOE_FANOUT_ASYNC=1 (default): the workers live in a persistent pool
++// created on first use and each op only submits its slice list — the compute
++// threads start immediately and fault on demand for slices the pool has not
++// reached yet, so page-in overlaps compute within the node and trails into the
++// next nodes. Submission applies backpressure on a small job ring: a slot is
++// only reused once every pool worker has passed it, which keeps each worker's
++// view of the ring consistent and bounds the submitter's wait. =0 restores the
++// per-op spawn/join fanout (touch-then-compute).
+ static atomic_int ggml_moe_fanout_sink = 0;
+ 
+ struct ggml_moe_fanout_slice { char * p; size_t n; };
+@@ -1676,46 +1685,194 @@ static const struct ggml_moe_pread_file * ggml_moe_pread_resolve(const void * ad
+     return NULL;
+ }
+ 
++// page in one slice: exact-size pread when a model mapping was resolved,
++// else a one-byte-per-page touch walk to fault it in.
++static void ggml_moe_fanout_touch_slice(const struct ggml_moe_fanout_slice * s,
++        long pg, const struct ggml_moe_pread_file * pf,
++        char ** scratch, size_t * scratch_n) {
++    const char * p = s->p;
++    const size_t n = s->n;
++    if (pf) {
++        off_t off = pf->map_off + (p - (const char *) pf->map_start);
++        if (*scratch_n < n) {
++            free(*scratch);
++            *scratch = (char *) malloc(n);
++            *scratch_n = *scratch ? n : 0;
++        }
++        if (*scratch) {
++            size_t got = 0;
++            while (got < n) {
++                ssize_t r = pread(pf->fd, *scratch + got, n - got, off + (off_t) got);
++                if (r <= 0) {
++                    break;
++                }
++                got += (size_t) r;
++            }
++            if (got == n) {
++                return; // slice is now page-cache-resident; compute faults hit RAM
++            }
++        }
++    }
++    uint32_t sink = 0;
++    for (size_t off = 0; off < n; off += (size_t) pg) {
++        sink += (uint32_t) p[off];
++    }
++    atomic_fetch_add(&ggml_moe_fanout_sink, (int) (sink & 1u));
++}
++
++// drain one ctx's slices through the shared cursor; used by both the pool
++// workers and the legacy inline fanout.
++static void ggml_moe_fanout_drain(const struct ggml_moe_fanout_ctx * c,
++        char ** scratch, size_t * scratch_n) {
++    for (;;) {
++        int i = atomic_fetch_add(&c->next, 1);
++        if (i >= c->n_sl) break;
++        ggml_moe_fanout_touch_slice(&c->sl[i], c->pg, c->pf, scratch, scratch_n);
++    }
++}
++
+ static void * ggml_moe_fanout_worker(void * arg) {
+     struct ggml_moe_fanout_ctx * c = (struct ggml_moe_fanout_ctx * ) arg;
+     char * scratch = NULL;
+     size_t scratch_n = 0;
+-    for (;;) {
+-        int i = atomic_fetch_add(&c->next, 1);
+-        if (i >= c->n_sl) break;
+-        const char * p = c->sl[i].p;
+-        const size_t n = c->sl[i].n;
+-        if (c->pf) {
+-            off_t off = c->pf->map_off + (p - (const char *) c->pf->map_start);
+-            if (scratch_n < n) {
+-                free(scratch);
+-                scratch = (char *) malloc(n);
+-                scratch_n = scratch ? n : 0;
+-            }
+-            if (scratch) {
+-                size_t got = 0;
+-                while (got < n) {
+-                    ssize_t r = pread(c->pf->fd, scratch + got, n - got, off + (off_t) got);
+-                    if (r <= 0) {
+-                        break;
+-                    }
+-                    got += (size_t) r;
+-                }
+-                if (got == n) {
+-                    continue; // slice is now page-cache-resident; compute faults hit RAM
+-                }
+-            }
+-        }
+-        uint32_t sink = 0;
+-        for (size_t off = 0; off < n; off += (size_t) c->pg) {
+-            sink += (uint32_t) p[off];
+-        }
+-        atomic_fetch_add(&ggml_moe_fanout_sink, (int) (sink & 1u));
+-    }
++    ggml_moe_fanout_drain(c, &scratch, &scratch_n);
+     free(scratch);
+     return NULL;
+ }
+ 
++// ---- persistent async fanout pool -----------------------------------------
++//
++// One pool per process. Jobs enter a fixed ring; a ring slot is only reused
++// once every pool worker has passed the job (its active count drained), so a
++// worker can always dereference jobs[done % RING] safely and the submitter at
++// that slot blocks on cv_free until then. Pool threads process jobs strictly
++// in submission order, which keeps the page-in stream file-offset ordered.
++
++#define GGML_MOE_FANOUT_POOL_MAX 32
++#define GGML_MOE_FANOUT_RING     8
++
++struct ggml_moe_fanout_job {
++    struct ggml_moe_fanout_ctx c;
++    atomic_int active;   // pool workers that have not passed this job yet
++    bool       in_use;
++    // GGML_MOE_NODE_LOG: submit and drain timestamps (CLOCK_MONOTONIC ns)
++    // to expose the IO/compute phase split per mul_mat_id node.
++    long long    submit_ns;
++    atomic_long  done_ns;
++};
++
++static struct {
++    pthread_mutex_t mu;
++    pthread_cond_t  cv_work;
++    pthread_cond_t  cv_free;
++    pthread_t       tid[GGML_MOE_FANOUT_POOL_MAX];
++    int             n_threads;
++    bool            started;
++    bool            disabled;  // pool start failed; stay on the legacy path
++    bool            shutdown;
++    bool            node_log;  // GGML_MOE_NODE_LOG=1: per-node phase lines
++    int             submitted;
++    struct ggml_moe_fanout_job jobs[GGML_MOE_FANOUT_RING];
++} g_moe_pool = {
++    .mu      = PTHREAD_MUTEX_INITIALIZER,
++    .cv_work = PTHREAD_COND_INITIALIZER,
++    .cv_free = PTHREAD_COND_INITIALIZER,
++};
++
++static void * ggml_moe_fanout_pool_worker(void * arg) {
++    (void) arg;
++    char * scratch = NULL;
++    size_t scratch_n = 0;
++    int done = 0; // jobs this worker has fully passed
++    pthread_mutex_lock(&g_moe_pool.mu);
++    for (;;) {
++        while (!g_moe_pool.shutdown && done >= g_moe_pool.submitted) {
++            pthread_cond_wait(&g_moe_pool.cv_work, &g_moe_pool.mu);
++        }
++        if (g_moe_pool.shutdown && done >= g_moe_pool.submitted) {
++            break;
++        }
++        struct ggml_moe_fanout_job * j = &g_moe_pool.jobs[done % GGML_MOE_FANOUT_RING];
++        pthread_mutex_unlock(&g_moe_pool.mu);
++        ggml_moe_fanout_drain(&j->c, &scratch, &scratch_n);
++        pthread_mutex_lock(&g_moe_pool.mu);
++        done++;
++        if (atomic_fetch_sub(&j->active, 1) == 1) {
++            if (g_moe_pool.node_log) {
++                struct timespec ts;
++                clock_gettime(CLOCK_MONOTONIC, &ts);
++                atomic_store(&j->done_ns, (long long) ts.tv_sec * 1000000000ll + ts.tv_nsec);
++            }
++            free(j->c.sl);
++            j->c.sl   = NULL;
++            j->in_use = false;
++            pthread_cond_broadcast(&g_moe_pool.cv_free);
++        }
++    }
++    pthread_mutex_unlock(&g_moe_pool.mu);
++    free(scratch);
++    return NULL;
++}
++
++// take ownership of sl on success; returns false when the pool is unavailable
++// (then the caller runs the legacy inline fanout and owns sl). job_out (may be
++// NULL) receives the ring slot the job was placed in, for the node-phase log.
++static bool ggml_moe_fanout_pool_submit(struct ggml_moe_fanout_slice * sl,
++        int n_sl, long pg, const struct ggml_moe_pread_file * pf, int n_threads,
++        struct ggml_moe_fanout_job ** job_out) {
++    if (n_threads > GGML_MOE_FANOUT_POOL_MAX) {
++        n_threads = GGML_MOE_FANOUT_POOL_MAX;
++    }
++    pthread_mutex_lock(&g_moe_pool.mu);
++    if (g_moe_pool.disabled) {
++        pthread_mutex_unlock(&g_moe_pool.mu);
++        return false;
++    }
++    if (!g_moe_pool.started) {
++        g_moe_pool.started = true;
++        g_moe_pool.n_threads = n_threads;
++        int started = 0;
++        for (int t = 0; t < n_threads; ++t) {
++            if (pthread_create(&g_moe_pool.tid[t], NULL, ggml_moe_fanout_pool_worker, NULL) == 0) {
++                started++;
++            }
++        }
++        if (started == 0) {
++            g_moe_pool.disabled = true;
++            pthread_mutex_unlock(&g_moe_pool.mu);
++            return false;
++        }
++        g_moe_pool.n_threads = started;
++    }
++    struct ggml_moe_fanout_job * j = &g_moe_pool.jobs[g_moe_pool.submitted % GGML_MOE_FANOUT_RING];
++    while (j->in_use) {
++        pthread_cond_wait(&g_moe_pool.cv_free, &g_moe_pool.mu);
++    }
++    if (!g_moe_pool.node_log) {
++        const char * e = getenv("GGML_MOE_NODE_LOG");
++        g_moe_pool.node_log = (e && e[0] == '1');
++    }
++    if (g_moe_pool.node_log) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        j->submit_ns = (long long) ts.tv_sec * 1000000000ll + ts.tv_nsec;
++    }
++    j->c.sl   = sl;
++    j->c.n_sl = n_sl;
++    j->c.pg   = pg;
++    j->c.pf   = pf;
++    atomic_init(&j->c.next, 0);
++    atomic_store_explicit(&j->active, g_moe_pool.n_threads, memory_order_seq_cst);
++    j->in_use = true;
++    g_moe_pool.submitted++;
++    if (job_out) {
++        *job_out = j;
++    }
++    pthread_cond_broadcast(&g_moe_pool.cv_work);
++    pthread_mutex_unlock(&g_moe_pool.mu);
++    return true;
++}
++
+ // GGML_MOE_MMAP_DONTNEED: release routed expert pages after the op computes
+ // them (bounded page-cache window for SSD-offloaded experts). Inactive unless
+ // set to exactly "1".
+@@ -2053,14 +2210,28 @@ static void ggml_compute_forward_mul_mat_id(
+     // fault in serially at queue depth ~1. LLAMA_MOE_FANOUT=N (default 8)
+     // fault-in all routed slices from N concurrent worker threads; N=0 falls
+     // back to the passive single-thread MADV_WILLNEED kick.
++    long long moe_node_t0 = 0;
++    struct ggml_moe_fanout_job * moe_node_job = NULL;
++    size_t moe_node_bytes = 0;
+     if (ith == 0) {
+         static int moe_fanout_done = 0;
+         static int moe_fanout_n = 8;
++        static int moe_fanout_async = 1;
++        static int moe_node_log = 0;
+         if (!moe_fanout_done) {
+             const char * e = getenv("LLAMA_MOE_FANOUT");
+             moe_fanout_n = (e && e[0]) ? atoi(e) : 8;
+             if (moe_fanout_n < 0) moe_fanout_n = 0;
+             if (moe_fanout_n > 32) moe_fanout_n = 32;
++            const char * ea = getenv("LLAMA_MOE_FANOUT_ASYNC");
++            moe_fanout_async = (ea && ea[0] == '0') ? 0 : 1;
++            // the post-node DONTNEED window assumes page-in finished before the
++            // barrier; async submission would race it into double reads.
++            if (ggml_cpu_mmid_page_release_enabled()) {
++                moe_fanout_async = 0;
++            }
++            const char * el = getenv("GGML_MOE_NODE_LOG");
++            moe_node_log = (el && el[0] == '1');
+             moe_fanout_done = 1;
+         }
+         const long pg = sysconf(_SC_PAGESIZE);
+@@ -2076,50 +2247,68 @@ static void ggml_compute_forward_mul_mat_id(
+                     char * p = (char *) src0->data + cur_a * nb02;
+                     sl[n_sl].p = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
+                     sl[n_sl].n = (size_t) nb02 + (size_t) (p - sl[n_sl].p);
++                    moe_node_bytes += sl[n_sl].n;
+                     n_sl++;
+                 }
+             }
+         }
+         if (n_sl > 0) {
+-            struct ggml_moe_fanout_ctx ctx;
+-            ctx.sl = sl;
+-            ctx.n_sl = n_sl;
+-            ctx.pg = pg;
+-            atomic_init(&ctx.next, 0);
+-            {
+-                static int moe_pread_done = 0;
+-                static int moe_pread_on = 0;
+-                if (!moe_pread_done) {
+-                    const char * e = getenv("LLAMA_MOE_PREAD");
+-                    moe_pread_on = (e && e[0] == '1');
+-                    moe_pread_done = 1;
++            static int moe_pread_done = 0;
++            static int moe_pread_on = 0;
++            if (!moe_pread_done) {
++                const char * e = getenv("LLAMA_MOE_PREAD");
++                moe_pread_on = (e && e[0] == '1');
++                moe_pread_done = 1;
++            }
++            const struct ggml_moe_pread_file * pf =
++                moe_pread_on ? ggml_moe_pread_resolve(src0->data) : NULL;
++            bool dispatched = false;
++            if (moe_fanout_async) {
++                if (moe_node_log) {
++                    struct timespec ts;
++                    clock_gettime(CLOCK_MONOTONIC, &ts);
++                    moe_node_t0 = (long long) ts.tv_sec * 1000000000ll + ts.tv_nsec;
+                 }
+-                ctx.pf = moe_pread_on ? ggml_moe_pread_resolve(src0->data) : NULL;
++                dispatched = ggml_moe_fanout_pool_submit(sl, n_sl, pg, pf, moe_fanout_n,
++                    moe_node_log ? &moe_node_job : NULL);
+             }
+-            pthread_t tid[31];
+-            int nth_w = moe_fanout_n - 1;
+-            if (nth_w > n_sl - 1) nth_w = n_sl - 1;
+-            if (nth_w > 31) nth_w = 31;
+-            for (int t = 0; t < nth_w; ++t) {
+-                pthread_create(&tid[t], NULL, ggml_moe_fanout_worker, &ctx);
+-            }
+-            ggml_moe_fanout_worker(&ctx);
+-            for (int t = 0; t < nth_w; ++t) {
+-                pthread_join(tid[t], NULL);
+-            }
+-            if (atomic_load(&ggml_moe_fanout_sink) == 123456789) {
+-                fprintf(stderr, "MAGNET\n");
++            if (!dispatched) {
++                struct ggml_moe_fanout_ctx ctx;
++                ctx.sl = sl;
++                ctx.n_sl = n_sl;
++                ctx.pg = pg;
++                ctx.pf = pf;
++                atomic_init(&ctx.next, 0);
++                pthread_t tid[31];
++                int nth_w = moe_fanout_n - 1;
++                if (nth_w > n_sl - 1) nth_w = n_sl - 1;
++                if (nth_w > 31) nth_w = 31;
++                for (int t = 0; t < nth_w; ++t) {
++                    pthread_create(&tid[t], NULL, ggml_moe_fanout_worker, &ctx);
++                }
++                ggml_moe_fanout_worker(&ctx);
++                for (int t = 0; t < nth_w; ++t) {
++                    pthread_join(tid[t], NULL);
++                }
++                if (atomic_load(&ggml_moe_fanout_sink) == 123456789) {
++                    fprintf(stderr, "MAGNET\n");
++                }
++                free(sl);
+             }
++            // dispatched: ownership of sl moved to the pool job; the last pool
++            // worker to pass the job frees it.
+         } else {
+-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+-                if (matrix_row_counts[cur_a] == 0) {
+-                    continue;
++            free(sl);
++            if (moe_fanout_n == 0) {
++                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                    if (matrix_row_counts[cur_a] == 0) {
++                        continue;
++                    }
++                    void * p = (char *) src0->data + cur_a * nb02;
++                    madvise((void *) ((uintptr_t) p & ~(uintptr_t) (pg - 1)), (size_t) nb02, MADV_WILLNEED);
+                 }
+-                void * p = (char *) src0->data + cur_a * nb02;
+-                madvise((void *) ((uintptr_t) p & ~(uintptr_t) (pg - 1)), (size_t) nb02, MADV_WILLNEED);
+             }
+         }
+-        free(sl);
+     }
+ 
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+@@ -2204,6 +2393,23 @@ static void ggml_compute_forward_mul_mat_id(
+     // clean stream. Only file-backed shared ranges are ever madvise'd: for a
+     // private anonymous mapping MADV_DONTNEED would zero the data.
+     ggml_barrier(params->threadpool);
++    if (ith == 0 && moe_node_job != NULL) {
++        // moe_node_job points at a static ring slot; it can only be refilled by
++        // this same thread, which has not submitted again. Reading its phase
++        // timestamps after the drain is safe.
++        long long t1 = (long long) atomic_load(&moe_node_job->done_ns);
++        double io_ms  = t1 > moe_node_t0 ? (t1 - moe_node_t0) / 1e6 : 0.0;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        long long t2 = (long long) ts.tv_sec * 1000000000ll + ts.tv_nsec;
++        fprintf(stderr,
++            "moe-node[%s] tokens=%" PRId64 " sl=%d MB=%.1f node_ms=%.1f io_ms=%.1f tail_ms=%.1f\n",
++            src0->name, ids->ne[1], moe_node_job->c.n_sl,
++            (double) moe_node_bytes / (1024.0 * 1024.0),
++            (t2 - moe_node_t0) / 1e6, io_ms,
++            io_ms > 0.0 ? ((t2 - moe_node_t0) - (t1 - moe_node_t0)) / 1e6 : 0.0);
++        moe_node_job = NULL;
++    }
+     if (ith == 0 && ggml_cpu_mmid_page_release_enabled()) {
+         const long pg = sysconf(_SC_PAGESIZE);
+         if (pg > 0 && ggml_cpu_range_is_file_backed(src0->data, (size_t) (src0->nb[2] * n_as))) {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5fa1619b8..5a9fb1351 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -18721,6 +18721,26 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                         return false;
+                     }
+                 }
++                // GGML_VK_MOE_HOST_MAX_IDS=N: expert weights mapped into host
++                // memory (e.g. the Vulkan_Host buffers --cpu-moe produces) are
++                // streamed by the GPU shaders through uncontrolled page faults;
++                // at prefill widths that measured ~0.8 GB/s effective. When the
++                // id count exceeds N, reject the op so the sched routes it to
++                // the CPU backend, whose mul_mat_id streams the same host pages
++                // with explicit fanout ordering, readahead control and async
++                // overlap. -1 (default) keeps the historical GPU routing.
++                if (op->op == GGML_OP_MUL_MAT_ID) {
++                    static int moe_host_max_ids = -2;
++                    if (moe_host_max_ids == -2) {
++                        const char * e = getenv("GGML_VK_MOE_HOST_MAX_IDS");
++                        moe_host_max_ids = e ? atoi(e) : -1;
++                    }
++                    if (moe_host_max_ids >= 0 && op->src[2] && op->src[2]->ne[1] > (int64_t) moe_host_max_ids &&
++                        op->src[0]->buffer && ggml_backend_buft_is_host(op->src[0]->buffer->buft) &&
++                        op->src[0]->buffer->buft != ggml_backend_cpu_buffer_type()) {
++                        return false;
++                    }
++                }
+                 switch (src0_type) {
+                     case GGML_TYPE_F32:
+                     case GGML_TYPE_F16:
+-- 
+2.55.0
+

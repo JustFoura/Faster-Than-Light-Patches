@@ -1,0 +1,50 @@
+From d6862e635912cb406cbf28189f1aaa265e7eba20 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 20:12:56 +1300
+Subject: [PATCH 08/18] PLE n-gram table: MADV_RANDOM whenever
+ LLAMA_MOE_MADV_RANDOM is set
+
+The PLE access is ~24 random 90-byte rows (4 KiB pages) per token at every
+width - prompt passes included - so unlike the expert mappings it is never
+sequential; default fault-around/reahead on the 26.8 GiB table drags in
+neighbors on every cold row. Candidate for the unattributed share of the
+506 MiB/tok warm-decode read volume (miss chain accounts for ~0.30 GiB).
+---
+ src/llama-moecache.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/llama-moecache.cpp b/src/llama-moecache.cpp
+index bbe95f07a..7c90db151 100644
+--- a/src/llama-moecache.cpp
++++ b/src/llama-moecache.cpp
+@@ -476,6 +476,27 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
+             }
+         }
+ 
++        // LLAMA_MOE_MADV_RANDOM (either value) also flips the PLE n-gram
++        // table's mapping: its access is ~24 random 90-byte rows (4 KiB
++        // pages) per token at EVERY width - prompt passes included - so
++        // unlike the expert mappings it is never sequential and MADV_RANDOM
++        // is unconditional. Default fault-around/reahead on this 26.8 GiB
++        // table otherwise drags in neighbors on every cold row.
++        {
++            const char * e = getenv("LLAMA_MOE_MADV_RANDOM");
++            if (e && e[0]) {
++                for (const auto & tn : model.tensors_by_name) {
++                    if (tn.first == "per_layer_token_embd.weight") {
++                        const long pg = sysconf(_SC_PAGESIZE);
++                        void * p = (void *) ((uintptr_t) tn.second->data & ~(uintptr_t) (pg - 1));
++                        madvise(p, ggml_nbytes(tn.second) + pg, MADV_RANDOM);
++                        LLAMA_LOG_INFO("%s: MADV_RANDOM applied to the PLE n-gram table\n", __func__);
++                        break;
++                    }
++                }
++            }
++        }
++
+         mc->worker = std::thread([mc]() {
+             for (;;) {
+                 upload_job j;
+-- 
+2.55.0
+

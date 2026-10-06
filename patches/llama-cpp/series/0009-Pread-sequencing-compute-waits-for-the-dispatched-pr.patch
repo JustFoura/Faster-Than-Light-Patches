@@ -1,0 +1,94 @@
+From 06fecc3222381619f976c4438412029acac2b9ac Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 20:41:42 +1300
+Subject: [PATCH 09/18] Pread sequencing: compute waits for the dispatched
+ pread job before touching slices
+
+The async pool drained a node's exact-size preads while the compute threads
+were already walking the same slices - under MADV_RANDOM the racing compute
+faulted the same miss pages from disk at 4 KiB granularity. Measured ~2x
+read amplification on the miss stream (494 MiB/tok vs ~250 design) and ~30%
+of the disk time wasted; PREAD still earned +32% over MADV-only (1.76 t/s)
+despite the race. Now thread 0 publishes a generation + job pointer every
+mul_mat_id op and every compute thread waits for the published job's
+active==0 before its compute loop; the per-op barrier orders generation
+reuse. Touch-path jobs publish NULL and keep their overlap.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 45 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index da7c854bf..de6c75d4b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1925,6 +1925,42 @@ static bool ggml_moe_fanout_pool_submit(struct ggml_moe_fanout_slice * sl,
+     return true;
+ }
+ 
++// Pread sequencing (LLAMA_MOE_PREAD at decode/verify widths): the persistent
++// pool drains a job's exact-size preads asynchronously; without sequencing,
++// the compute threads race the preads and fault the same miss pages from disk
++// at 4 KiB granularity under MADV_RANDOM - measured ~2x read amplification on
++// the miss stream (494 vs ~250 MiB/tok) with ~30% of the disk time wasted.
++// Thread 0 publishes a generation + job pointer every mul_mat_id op; every
++// compute thread waits for the published job (active == 0) before touching
++// slice data. The barrier at the top of the next op orders generation reuse:
++// no thread can observe generation N+1 before finishing its own wait for N.
++static _Atomic(struct ggml_moe_fanout_job *) g_moe_pread_wait_job;
++static _Atomic(unsigned long long)           g_moe_pread_wait_gen;
++static __thread unsigned long long           g_moe_pread_seen;
++
++static void ggml_moe_pread_publish(bool dispatched_pread, struct ggml_moe_fanout_job * job) {
++    atomic_store_explicit(&g_moe_pread_wait_job, dispatched_pread ? job : NULL,
++            memory_order_release);
++    atomic_fetch_add_explicit(&g_moe_pread_wait_gen, 1, memory_order_release);
++}
++
++static void ggml_moe_pread_wait(void) {
++    const unsigned long long gen =
++        atomic_load_explicit(&g_moe_pread_wait_gen, memory_order_acquire);
++    if (gen == g_moe_pread_seen) {
++        return;
++    }
++    g_moe_pread_seen = gen;
++    struct ggml_moe_fanout_job * j =
++        atomic_load_explicit(&g_moe_pread_wait_job, memory_order_acquire);
++    if (!j) {
++        return;
++    }
++    while (atomic_load_explicit(&j->active, memory_order_acquire) != 0) {
++        sched_yield();
++    }
++}
++
+ // GGML_MOE_MMAP_DONTNEED: release routed expert pages after the op computes
+ // them (bounded page-cache window for SSD-offloaded experts). Inactive unless
+ // set to exactly "1".
+@@ -2327,7 +2363,7 @@ static void ggml_compute_forward_mul_mat_id(
+                     moe_node_t0 = (long long) ts.tv_sec * 1000000000ll + ts.tv_nsec;
+                 }
+                 dispatched = ggml_moe_fanout_pool_submit(sl, n_sl, pg, pf, moe_fanout_n,
+-                    moe_node_log ? &moe_node_job : NULL);
++                    &moe_node_job);
+             }
+             if (!dispatched) {
+                 struct ggml_moe_fanout_ctx ctx;
+@@ -2366,8 +2402,15 @@ static void ggml_compute_forward_mul_mat_id(
+                 }
+             }
+         }
++        // every op advances the generation so the other compute threads stop
++        // waiting; the job pointer is NULL unless a pread job was dispatched
++        ggml_moe_pread_publish(moe_node_job != NULL, moe_node_job);
+     }
+ 
++    // pread sequencing: every thread (thread 0 included) waits for this op's
++    // dispatched pread job to drain before touching slice data
++    ggml_moe_pread_wait();
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+-- 
+2.55.0
+

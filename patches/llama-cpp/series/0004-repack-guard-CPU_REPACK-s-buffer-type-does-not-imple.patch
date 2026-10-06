@@ -1,0 +1,30 @@
+From acd2803c96aa3a36a46387fdc66e9d76e0ae366f Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 16:56:46 +1300
+Subject: [PATCH 04/18] repack guard: CPU_REPACK's buffer type does not
+ implement is_host - drop the is_host requirement, the REPACK name check is
+ exact
+
+---
+ src/llama-model-loader.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 5decd50ff..f9c22d776 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1275,7 +1275,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         // is pointless when the plain CPU buffer can wrap the mapped pages for
+         // the same kernels. CPU_Mapped and CPU_REPACK are distinct static
+         // types, so the name check is what separates them here.
+-        if (use_mmap && buft && ggml_backend_buft_is_host(buft)
++        // (note: CPU_REPACK's buffer type does not implement is_host, so the
++        // predicate below must not require it; the name check is exact enough
++        // - no GPU or CPU buffer type carries the REPACK substring.)
++        if (use_mmap && buft
+                 && buft != ggml_backend_cpu_buffer_type()
+                 && strstr(ggml_backend_buft_name(buft), "REPACK") != nullptr) {
+             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-- 
+2.55.0
+

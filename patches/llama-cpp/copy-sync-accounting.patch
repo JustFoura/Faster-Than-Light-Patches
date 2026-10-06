@@ -1,0 +1,182 @@
+From a8cae55270a2b8bde23249571cfe7ee5a8493652 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Fri, 2 Oct 2026 01:36:58 +1300
+Subject: [PATCH] Account the per-copy device synchronize on the prompt-path
+ copy path
+
+Measures, behind LLAMA_VK_COPY_SYNC_LOG=1, what ggml_backend_vk_set_tensor_2d_async's
+staging fallback actually costs: every large host->device copy ends in
+ggml_vk_synchronize() -> ggml_vk_wait_for_fence(), which blocks the calling
+thread on the GPU fence. Timers split that into the host in_memcpys drain and
+the fence wait, plus a copy-size histogram. Default off; a static bool read
+once, so an unset env changes nothing but a branch.
+
+This exists because overlap-design.md plans to pool sync_staging for copy/compute
+overlap, and that only works if the CPU can run more than one copy ahead. It
+cannot, while this wait is there. Measured on the 14,960-token one-pass gate:
+
+  depth   t/s   pass   drain   fence   staging calls / bytes
+    1   159.0    94s   29.8s   44.2s   13,696 / 47.2 GB
+    8   164.3    91s   23.2s   44.0s   13,696 / 47.2 GB
+   16   173.8    86s   23.6s   44.1s   13,696 / 47.2 GB
+   32   168.0    89s   25.3s   43.2s   13,696 / 47.2 GB
+
+All four arms byte-identical to the 10-02 reference, so the accounting is
+behaviour-neutral. Two things fall out that the docs had backwards:
+
+  - Depth is a real lever. Drain drops 22% from depth 1 to 8 and saturates
+    there; t/s cannot see it (159.0-173.8 spans the documented ~13 t/s band).
+    The staging read path tops out near 2.0 GB/s, not the 4.09 GB/s a
+    sequential probe reports.
+  - The "144 tensors x ~450 MB" model is wrong. Nothing in this stream exceeds
+    64 MB: 13,696 copies averaging 3.4 MB. That is also why depth 8 only helps
+    so much, and why most of the volume never reaches ggml_vk_pread_parallel
+    at all (it needs >= 4 MB).
+
+Committed on a branch rather than the detached HEAD the previous commits used,
+so the instrumentation cannot be orphaned by a checkout.
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 88 +++++++++++++++++++++++++++-
+ 1 file changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index aee2a9c0e..1261eba68 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8397,6 +8397,45 @@ static vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
+ // sites.
+ static bool ggml_vk_pread_parallel(const void * src, void * dst, size_t size);
+ 
++// ---- large-copy synchronize accounting (2026-10-02) ------------------------
++// ggml_backend_vk_set_tensor_2d_async ends its staging-copy fallback with
++// ggml_vk_synchronize(), which reaches ggml_vk_wait_for_fence() and blocks the
++// calling thread on the GPU fence. If that runs per copy it paces the whole
++// prompt-path copy stream to one-at-a-time GPU drain, which would explain both
++// the ~0.9 GB/s read rate and why deeper preads changed nothing. This block
++// measures it instead of assuming it. Off unless LLAMA_VK_COPY_SYNC_LOG=1.
++struct ggml_vk_copy_sync_stats {
++    long calls    = 0;   // set_tensor_2d_async staging-fallback synchronizes
++    long bytes    = 0;   // staging_size across those calls
++    long sync_us  = 0;   // total wall time inside those calls
++    long drain_us = 0;   // ... of which the host memcpy/pread drain
++    long fence_us = 0;   // ... of which the blocking fence wait
++    long hist_n[5] = {0, 0, 0, 0, 0};   // calls by size bucket
++    long hist_b[5] = {0, 0, 0, 0, 0};   // bytes by size bucket
++};
++static ggml_vk_copy_sync_stats g_vk_copy_sync;
++
++static bool ggml_vk_copy_sync_enabled() {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char * e = getenv("LLAMA_VK_COPY_SYNC_LOG");
++        enabled = (e && e[0]) ? 1 : 0;
++    }
++    return enabled == 1;
++}
++
++static inline int64_t ggml_vk_now_us() {
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
++}
++
++// Wall-clock epoch ms, comparable to `date +%s%3N` so an offline harness can
++// window the cumulative lines to a specific request.
++static inline int64_t ggml_vk_now_wall_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
+ // Submit any pending transfer queue work and signal the transfer semaphore.
+ // The next compute context created via ggml_vk_get_compute_ctx will wait on this semaphore.
+ // Returns true if work was submitted.
+@@ -8415,11 +8454,16 @@ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
+     // a drive that sustains 4.09 GB/s at depth 8); concurrent preads fetch the
+     // same bytes into the same staging buffer. Falls back to memcpy whenever
+     // the source is not a resolvable file mapping.
++    const bool sync_log = ggml_vk_copy_sync_enabled();
++    const int64_t drain_t0 = sync_log ? ggml_vk_now_us() : 0;
+     for (auto& cpy : cpy_ctx->in_memcpys) {
+         if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
+             memcpy(cpy.dst, cpy.src, cpy.n);
+         }
+     }
++    if (sync_log) {
++        g_vk_copy_sync.drain_us += ggml_vk_now_us() - drain_t0;
++    }
+ 
+     ctx->transfer_semaphore.value++;
+     cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->transfer_semaphore);
+@@ -17322,7 +17366,41 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
+                 deferred_memcpy((uint8_t *)ctx->sync_staging->ptr + i * size, (const uint8_t *)data + i * stride_data, size, &cpy_ctx->in_memcpys);
+             }
+         }
+-        ggml_vk_synchronize(ctx);
++        // Staging fallback: the host->staging copy above is only *recorded* into
++        // in_memcpys; it runs in ggml_vk_synchronize's drain. That call then
++        // blocks on the GPU fence, so with one staging buffer this path paces the
++        // whole copy stream to one copy deep. Accounted rather than assumed.
++        if (ggml_vk_copy_sync_enabled()) {
++            const int64_t t0 = ggml_vk_now_us();
++            ggml_vk_synchronize(ctx);
++            const int64_t dt = ggml_vk_now_us() - t0;
++
++            ggml_vk_copy_sync_stats & s = g_vk_copy_sync;
++            s.calls++;
++            s.bytes += (long) staging_size;
++            s.sync_us += dt;
++            const int b = staging_size < (1ull<<20)   ? 0 :
++                          staging_size < (8ull<<20)   ? 1 :
++                          staging_size < (64ull<<20)  ? 2 :
++                          staging_size < (256ull<<20) ? 3 : 4;
++            s.hist_n[b]++;
++            s.hist_b[b] += (long) staging_size;
++
++            if (s.calls == 1 || s.calls % 64 == 0) {
++                fprintf(stderr,
++                    "[copy-sync] %lld n=%ld %.2fGB sync=%.1fs drain=%.1fs fence=%.1fs avg=%.1fms "
++                    "xferq=%d | MB <1:%ld/%.0f 1-8:%ld/%.0f 8-64:%ld/%.0f 64-256:%ld/%.0f >256:%ld/%.0f\n",
++                    (long long) ggml_vk_now_wall_ms(),
++                    s.calls, s.bytes/1e9, s.sync_us/1e6, s.drain_us/1e6, s.fence_us/1e6,
++                    s.calls ? (double) s.sync_us/1000.0/s.calls : 0.0,
++                    ctx->device->async_use_transfer_queue ? 1 : 0,
++                    s.hist_n[0], s.hist_b[0]/1e6, s.hist_n[1], s.hist_b[1]/1e6,
++                    s.hist_n[2], s.hist_b[2]/1e6, s.hist_n[3], s.hist_b[3]/1e6,
++                    s.hist_n[4], s.hist_b[4]/1e6);
++            }
++        } else {
++            ggml_vk_synchronize(ctx);
++        }
+     }
+ }
+ 
+@@ -17465,11 +17543,15 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+         // Same large-copy page-in depth as the transfer-queue drain above; this
+         // is the path taken when async_use_transfer_queue is off, which is the
+         // default on this device.
++        const int64_t cdrain_t0 = ggml_vk_copy_sync_enabled() ? ggml_vk_now_us() : 0;
+         for (auto& cpy : compute_ctx->in_memcpys) {
+             if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
+                 memcpy(cpy.dst, cpy.src, cpy.n);
+             }
+         }
++        if (ggml_vk_copy_sync_enabled()) {
++            g_vk_copy_sync.drain_us += ggml_vk_now_us() - cdrain_t0;
++        }
+ 
+         if (ctx->device->serialize_submissions) {
+             ggml_vk_submit(compute_ctx, ctx->fence);
+@@ -17502,7 +17584,11 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+             ctx->device->compute_queue->handle->submit({}, ctx->fence);
+         }
+         if (!ctx->device->serialize_submissions) {
++            const int64_t fence_t0 = ggml_vk_copy_sync_enabled() ? ggml_vk_now_us() : 0;
+             ggml_vk_wait_for_fence(ctx);
++            if (ggml_vk_copy_sync_enabled()) {
++                g_vk_copy_sync.fence_us += ggml_vk_now_us() - fence_t0;
++            }
+         }
+         ctx->submit_pending = false;
+         if (cmd_buf) {
+-- 
+2.55.0

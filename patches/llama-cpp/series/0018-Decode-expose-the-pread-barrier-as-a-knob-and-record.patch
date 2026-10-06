@@ -1,0 +1,107 @@
+From 57cd58659925e5fe81e45fa0b4c36fead64e3857 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Fri, 2 Oct 2026 19:39:45 +1300
+Subject: [PATCH 18/18] Decode: expose the pread barrier as a knob, and record
+ why depth cannot work
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The barrier in ggml_moe_pread_wait() makes every compute thread spin on
+j->active == 0, so each MoE node is dispatch-all-preads -> wait-for-all ->
+compute with no overlap. LLAMA_MOE_PREAD_WAIT=0 disables it; unset keeps the
+original behaviour, and the job-index expression in the worker is unchanged
+character for character.
+
+Measured with the barrier off vs on, order-controlled A/B/A: 5.43 / 5.73 /
+5.66 t/s at 244.3 / 244.4 / 232.2 MiB/token. The barrier is not the cap, and
+it costs no read amplification to remove (bytes are identical), so it stays.
+
+The real cap is queue depth. probe-drive-rate.py at decode's exact request
+shape (816 KiB, buffered, random): QD1 1.16 GB/s, QD2 2.13, QD4 3.21, QD8
+3.96, QD16 4.26. Decode runs at 1.38-1.59 GB/s, i.e. depth ~1.2, while holding
+a 24-worker pool — because every worker has g=0 and drains the same
+`done`-indexed job, so concurrency is bounded by the slices in one job (~2,
+since the expert cache absorbs ~78% of routes) rather than by worker count.
+
+An earlier version of this commit added LLAMA_MOE_FANOUT_DEPTH to let workers
+run N jobs ahead. It deadlocks at N > 1 and no variant can work:
+ggml_moe_fanout_pool_submit publishes one job and the caller then blocks in
+ggml_moe_pread_wait until that job drains, so no second job is ever in flight
+for a worker to run ahead to. Depth has to come from submitting ahead, which
+is what the one-layer-ahead miss prefetch does. Left as a comment so the knob
+is not re-added.
+
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 34 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 77fd9eaad..bf5bd7c3b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1927,6 +1927,16 @@ static void * ggml_moe_fanout_pool_worker(void * arg) {
+     int done = 0; // jobs this worker has fully passed (of its group)
+     pthread_mutex_lock(&g_moe_pool.mu);
+     for (;;) {
++        // NOTE: an earlier version let the workers run `depth` jobs ahead of the
++        // submitter to deepen the pread queue. It deadlocks at depth > 1 and the
++        // reason is structural, not a typo: ggml_moe_fanout_pool_submit publishes
++        // one job and the caller then blocks in ggml_moe_pread_wait until that
++        // job's active hits 0, so a second job is never in flight for a worker
++        // to run ahead to. Depth has to come from submitting AHEAD — which is
++        // what the one-layer-ahead miss prefetch (LLAMA_MOE_MISS_PREFETCH) does,
++        // by handing the pool the next layer's saved slice list before that
++        // layer's own op submits. Do not re-add a worker-side depth knob.
++        struct ggml_moe_fanout_job * j;
+         while (!g_moe_pool.shutdown &&
+                 (pipe ? 2 * done + g : done) >= g_moe_pool.submitted) {
+             pthread_cond_wait(&g_moe_pool.cv_work, &g_moe_pool.mu);
+@@ -1935,8 +1945,7 @@ static void * ggml_moe_fanout_pool_worker(void * arg) {
+                 (pipe ? 2 * done + g : done) >= g_moe_pool.submitted) {
+             break;
+         }
+-        struct ggml_moe_fanout_job * j =
+-            &g_moe_pool.jobs[(pipe ? 2 * done + g : done) % GGML_MOE_FANOUT_RING];
++        j = &g_moe_pool.jobs[(pipe ? 2 * done + g : done) % GGML_MOE_FANOUT_RING];
+         pthread_mutex_unlock(&g_moe_pool.mu);
+         ggml_moe_fanout_drain(&j->c, &scratch, &scratch_n);
+         pthread_mutex_lock(&g_moe_pool.mu);
+@@ -1994,6 +2003,8 @@ static bool ggml_moe_fanout_pool_submit(struct ggml_moe_fanout_slice * sl,
+             return false;
+         }
+         g_moe_pool.n_threads = started;
++        fprintf(stderr, "[moe-fanout] threads=%d pipe=%d ring=%d\n",
++                started, (int) g_moe_pool.pipe, GGML_MOE_FANOUT_RING);
+     }
+     struct ggml_moe_fanout_job * j = &g_moe_pool.jobs[g_moe_pool.submitted % GGML_MOE_FANOUT_RING];
+     while (j->in_use) {
+@@ -2044,7 +2055,26 @@ static void ggml_moe_pread_publish(bool dispatched_pread, struct ggml_moe_fanout
+     atomic_fetch_add_explicit(&g_moe_pread_wait_gen, 1, memory_order_release);
+ }
+ 
++// LLAMA_MOE_PREAD_WAIT=0 removes the barrier entirely: compute threads fault the
++// miss pages themselves while the pool is still preading them. That is the
++// ~2x read amplification the barrier was added to prevent, so OFF is the A/B
++// arm and not a proposed setting — it exists to measure whether the barrier is
++// what caps decode's read rate (1.42 GB/s) or whether the amplification costs
++// more than the overlap gains. Anything other than exactly "0" keeps the
++// original behaviour.
++static int ggml_moe_pread_wait_enabled(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("LLAMA_MOE_PREAD_WAIT");
++        on = !(e && e[0] == '0' && e[1] == '\0');
++    }
++    return on;
++}
++
+ static void ggml_moe_pread_wait(void) {
++    if (!ggml_moe_pread_wait_enabled()) {
++        return;
++    }
+     const unsigned long long gen =
+         atomic_load_explicit(&g_moe_pread_wait_gen, memory_order_acquire);
+     if (gen == g_moe_pread_seen) {
+-- 
+2.55.0

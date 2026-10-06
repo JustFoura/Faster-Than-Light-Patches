@@ -1,0 +1,49 @@
+# llama.cpp source trees / build artifacts
+# These live in ~/build, not here — but keep them out if anyone clones into this folder.
+llama.cpp/
+llama.cpp-*/
+cafe-llama.cpp/
+build/
+build-vulkan/
+build-*/
+cmake-build-*/
+
+# models — never commit weights
+*.gguf
+*.safetensors
+*.pt
+app/models/
+models/
+
+# vulkan / spirv header clones referenced by patches/llama-cpp/build.sh
+Vulkan-Headers/
+SPIRV-Headers/
+spirv-prefix/
+spirv-build/
+
+# editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# local configuration and generated benchmark output
+.env
+.env.*
+!.env.example
+*.server.log
+*.log
+*.csv
+*.jsonl
+*.gpu.csv
+*.io.csv
+*.parity.json
+*-results.json
+docs/bench-results-*/**/*.json
+docs/bench-results-*/**/*-results.txt

@@ -1,0 +1,127 @@
+From 778969b732c142330e05e80dc96ed51d69e961c7 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 21:13:52 +1300
+Subject: [PATCH 12/18] Sub-split fanout slices: keep the merged job at ~2
+ pieces per pool worker
+
+A merged decode job with 6-9 whole-expert slices issues only 6-9 concurrent
+reads and leaves the NVMe latency-bound (~0.9 GB/s in-job). Coarse slices
+are now split (x2-x4, 512 KB floor) so the pool's workers get queue depth;
+capacity bounded at 48*512*3 pieces.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 84 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 74 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index a3e06f4fe..2e35bb382 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2363,20 +2363,72 @@ static void ggml_compute_forward_mul_mat_id(
+         const int sib_covered = sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind > 0
+             ? g_moe_sib_covered[sib_il] : 0;
+         if (moe_fanout_n > 0 && !sib_covered) {
+-            sl = malloc(sizeof(struct ggml_moe_fanout_slice) * (size_t) n_as * 3);
++            // slices are appended coarse first, then split so the job keeps
++            // enough pieces for the pool's queue depth: a merged decode job
++            // with 6-9 whole-expert slices only issues 6-9 concurrent reads,
++            // leaving the NVMe latency-bound (~0.9 GB/s in-job). Split factor
++            // targets ~2 pieces per pool worker, capped at 512 KB minimum.
++            #define GGML_MOE_SLICE_MAX (48 * 512 * 3)
++            sl = malloc(sizeof(struct ggml_moe_fanout_slice) * GGML_MOE_SLICE_MAX);
+             if (sl) {
++                int split = 1;
++                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                    if (matrix_row_counts[cur_a] != 0) {
++                        n_sl++;
++                    }
++                }
++                // per-expert slice count = registered tensor count for the layer
++                int routes = 0;
++                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                    routes += matrix_row_counts[cur_a] != 0 ? 1 : 0;
++                }
++                int tensors = 1;
++                if (sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind >= 0) {
++                    for (int k = 0; k < 3; ++k) {
++                        if (k != sib_kind && g_moe_sib[sib_il][k].has) {
++                            tensors++;
++                        }
++                    }
++                }
++                n_sl = routes * tensors;
++                if (n_sl > 0) {
++                    split = (int) ((long long) moe_fanout_n * 2 + n_sl - 1) / n_sl;
++                    if (split > 4) split = 4;
++                    if (split < 1) split = 1;
++                    if ((long long) n_sl * split > GGML_MOE_SLICE_MAX) {
++                        split = GGML_MOE_SLICE_MAX / n_sl;
++                        if (split < 1) split = 1;
++                    }
++                }
++                n_sl = 0;
++                const size_t min_piece = 512UL << 10;
+                 for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                     if (matrix_row_counts[cur_a] == 0) {
+                         continue;
+                     }
+                     char * p = (char *) src0->data + cur_a * nb02;
+-                    sl[n_sl].p = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
+-                    sl[n_sl].n = (size_t) nb02 + (size_t) (p - sl[n_sl].p);
+-                    moe_node_bytes += sl[n_sl].n;
+-                    n_sl++;
++                    char * pb = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
++                    size_t tn = (size_t) nb02 + (size_t) (p - pb);
++                    size_t piece = tn / (size_t) split;
++                    if (piece < min_piece) {
++                        piece = tn;
++                        // one piece
++                        sl[n_sl].p = pb;
++                        sl[n_sl].n = tn;
++                        moe_node_bytes += tn;
++                        n_sl++;
++                        continue;
++                    }
++                    for (int c = 0; c < split; ++c) {
++                        sl[n_sl].p = pb + piece * (size_t) c;
++                        sl[n_sl].n = (c == split - 1) ? (tn - piece * (size_t) (split - 1)) : piece;
++                        moe_node_bytes += sl[n_sl].n;
++                        n_sl++;
++                    }
+                 }
+                 // merge registered same-layer siblings (own slices are first;
+-                // sibling slices prefetch ahead of that op's compute)
++                // sibling slices prefetch ahead of that op's compute), with
++                // the same split factor
+                 if (sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind >= 0) {
+                     for (int k = 0; k < 3; ++k) {
+                         if (k == sib_kind || !g_moe_sib[sib_il][k].has) {
+@@ -2388,10 +2440,22 @@ static void ggml_compute_forward_mul_mat_id(
+                                 continue;
+                             }
+                             char * p = (char *) g_moe_sib[sib_il][k].base + cur_a * g_moe_sib[sib_il][k].nb02;
+-                            sl[n_sl].p = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
+-                            sl[n_sl].n = g_moe_sib[sib_il][k].nb02 + (size_t) (p - sl[n_sl].p);
+-                            moe_node_bytes += sl[n_sl].n;
+-                            n_sl++;
++                            char * pb = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
++                            size_t tn = g_moe_sib[sib_il][k].nb02 + (size_t) (p - pb);
++                            size_t piece = tn / (size_t) split;
++                            if (piece < min_piece) {
++                                sl[n_sl].p = pb;
++                                sl[n_sl].n = tn;
++                                moe_node_bytes += tn;
++                                n_sl++;
++                                continue;
++                            }
++                            for (int c = 0; c < split; ++c) {
++                                sl[n_sl].p = pb + piece * (size_t) c;
++                                sl[n_sl].n = (c == split - 1) ? (tn - piece * (size_t) (split - 1)) : piece;
++                                moe_node_bytes += sl[n_sl].n;
++                                n_sl++;
++                            }
+                         }
+                     }
+                 }
+-- 
+2.55.0
+

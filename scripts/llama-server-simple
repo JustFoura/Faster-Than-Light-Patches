@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Custom llama.cpp build (Vulkan/gfx1200, DFlash2 sliding draft window,
+# KV cache in system RAM via Vulkan GTT - attention stays on the GPU).
+export LD_LIBRARY_PATH="$HOME/build/llama.cpp/build-vulkan/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LLAMA_KV_HOSTMEM=1
+exec "$HOME/build/llama.cpp/build-vulkan/bin/llama-server" "$@"

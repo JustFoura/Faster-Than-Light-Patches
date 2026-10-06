@@ -1,0 +1,80 @@
+diff --git i/ggml/src/ggml-vulkan/ggml-vulkan.cpp w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f2fb0cdeb..e44b88201 100644
+--- i/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -68,6 +68,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include <condition_variable>
+ #include <thread>
+ #include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
+ 
+ #if defined(_MSC_VER)
+ # define NOMINMAX 1
+@@ -16740,6 +16742,66 @@ static void ggml_vk_mmap_readahead_ahead(const void * src, size_t size) {
+     if (wend > m->end) {
+         wend = m->end;
+     }
++
++    // Order-aware advice (second cut, 10-01 night): the scheduler copies the
++    // SAME tensor sequence every pass, so the previous pass's address order
++    // predicts this pass's future exactly once learned. The first cut only
++    // advised file-adjacent addresses, which the GGUF layout does not match
++    // to graph order — measured neutral (185-205k major faults with the
++    // window on). Here: remember the traversal; on each copy, advise the
++    // span covering the NEXT few tensors of the learned sequence (plus the
++    // file-adjacent window and a mapping-range madvise as fallbacks).
++    static const int VK_RA_HIST = 320;
++    static const char * hist[VK_RA_HIST]; // tensor-end addresses in pass order
++    static int hist_n = 0;                // learned entries
++    static int hist_idx = -1;             // index of the current copy
++    if (hist_n > 0) {
++        if (hist_idx >= 0 && hist_idx < hist_n && hist[hist_idx] == p) {
++            hist_idx++;                    // sequence continuing as learned
++        } else if (hist[0] == p) {
++            hist_idx = 0;                  // new pass started
++        } else {
++            int found = -1;
++            for (int i = 0; i < hist_n; ++i) {
++                if (hist[i] == p) {
++                    found = i;
++                    break;
++                }
++            }
++            if (found >= 0) {
++                hist_idx = found + 1;      // out-of-order repeat (multi-ubatch)
++            } else if (hist_n < VK_RA_HIST) {
++                hist[hist_n++] = p;        // first pass: still learning
++                hist_idx = hist_n;
++            } else {
++                hist_idx = -1;             // full + unknown; advise adjacent only
++            }
++        }
++    } else {
++        hist[hist_n++] = p;
++        hist_idx = hist_n;
++    }
++
++    const long page = sysconf(_SC_PAGESIZE);
++    if (hist_idx >= 0 && hist_idx < hist_n) {
++        // span from the current position to three learned copies ahead
++        const char * lo = hist[hist_idx];
++        const char * hi2 = lo;
++        int seen = 0;
++        for (int i = hist_idx; i < hist_n && seen < 3; ++i, ++seen) {
++            if (hist[i] < lo) lo = hist[i];
++            if (hist[i] > hi2) hi2 = hist[i];
++        }
++        hi2 += 64ull * 1024 * 1024;        // cover the last body's tail
++        if (hi2 > m->end) hi2 = m->end;
++        if (lo < (const char *) m->base) lo = m->base;
++        if (hi2 > lo) {
++            posix_fadvise(m->fd, m->map_off + (lo - m->base), hi2 - lo,
++                    POSIX_FADV_WILLNEED);
++            const char * alo = (const char *) (((uintptr_t) lo) & ~((uintptr_t) page - 1));
++            madvise((void *) alo, hi2 - alo, MADV_WILLNEED); // best effort
++        }
++    }
+     if (wend > wstart) {
+         posix_fadvise(m->fd, m->map_off + (wstart - m->base), wend - wstart,
+                 POSIX_FADV_WILLNEED);

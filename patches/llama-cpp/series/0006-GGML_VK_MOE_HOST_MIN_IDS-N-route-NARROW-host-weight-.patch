@@ -1,0 +1,60 @@
+From 8ff4fe0d4a030b53ec9b4558fd54069cdac783bd Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 17:20:41 +1300
+Subject: [PATCH 06/18] GGML_VK_MOE_HOST_MIN_IDS=N: route NARROW host-weight
+ MUL_MAT_ID to the CPU kernel (mixed-workload polarity)
+
+Measured 09-29 ladder: the CPU kernel wins narrow ubatches (+25-30%
+effective GB/s at 442-2048 id rows) and loses the wide one-pass (55 vs
+88 t/s at 8502 ids, compute-bound). MAX_IDS (wide->CPU) is therefore the
+wrong default for a mixed decode+prefill server; MIN_IDS sends decode
+misses, verify widths and conversational prompts to the CPU kernel while
+long one-pass prompts stay on the GPU shader fault path.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5a9fb1351..e61f041cc 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -18731,14 +18731,33 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 // overlap. -1 (default) keeps the historical GPU routing.
+                 if (op->op == GGML_OP_MUL_MAT_ID) {
+                     static int moe_host_max_ids = -2;
++                    static int moe_host_min_ids = -2;
+                     if (moe_host_max_ids == -2) {
+                         const char * e = getenv("GGML_VK_MOE_HOST_MAX_IDS");
+                         moe_host_max_ids = e ? atoi(e) : -1;
++                        const char * e2 = getenv("GGML_VK_MOE_HOST_MIN_IDS");
++                        moe_host_min_ids = e2 ? atoi(e2) : -1;
+                     }
+-                    if (moe_host_max_ids >= 0 && op->src[2] && op->src[2]->ne[1] > (int64_t) moe_host_max_ids &&
+-                        op->src[0]->buffer && ggml_backend_buft_is_host(op->src[0]->buffer->buft) &&
++                    // both polarities gate on host-mapped weights (CPU_Mapped
++                    // is a distinct buffer type from the plain CPU one):
++                    // MAX_IDS=N rejects id counts > N (measured 09-29: wide
++                    // prefill on the CPU kernel is compute-bound and LOSES to
++                    // the shader fault path, so wide -> CPU is the wrong
++                    // default); MIN_IDS=N rejects id counts <= N, which is the
++                    // mixed-workload shape - decode misses and conversational
++                    // prompts (<= a few thousand ids) run on the CPU kernel
++                    // (+25-30% effective bandwidth there), long one-pass
++                    // prompts stay on the GPU.
++                    if (op->src[2] && op->src[0]->buffer &&
++                        ggml_backend_buft_is_host(op->src[0]->buffer->buft) &&
+                         op->src[0]->buffer->buft != ggml_backend_cpu_buffer_type()) {
+-                        return false;
++                        const int64_t n_ids = op->src[2]->ne[1];
++                        if (moe_host_max_ids >= 0 && n_ids > (int64_t) moe_host_max_ids) {
++                            return false;
++                        }
++                        if (moe_host_min_ids >= 0 && n_ids <= (int64_t) moe_host_min_ids) {
++                            return false;
++                        }
+                     }
+                 }
+                 switch (src0_type) {
+-- 
+2.55.0
+

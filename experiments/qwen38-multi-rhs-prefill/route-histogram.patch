@@ -1,0 +1,31 @@
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1709,6 +1709,28 @@
+             }
+         }
+ 
++        // Optional route-density report for tuning the model-specific multi-RHS
++        // threshold. Only inspect the router's gate expert tensor and prompt rows.
++        const char * route_hist_env = getenv("GGML_MOE_ROUTE_HISTOGRAM");
++        if (route_hist_env && route_hist_env[0] == '1' && ids->ne[1] > 1 &&
++            strstr(src0->name, "ffn_gate_exps")) {
++            uint64_t bins[5] = { 0, 0, 0, 0, 0 };
++            uint64_t assigned = 0;
++            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                const int64_t n_rows = matrix_row_counts[cur_a];
++                assigned += (uint64_t) n_rows;
++                if (n_rows == 0)      bins[0]++;
++                else if (n_rows == 1) bins[1]++;
++                else if (n_rows <= 3) bins[2]++;
++                else if (n_rows <= 7) bins[3]++;
++                else                  bins[4]++;
++            }
++            fprintf(stderr,
++                "moe-route-hist %s tokens=%" PRId64 " assigned=%" PRIu64
++                " experts[0/1/2-3/4-7/8+]=[%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "]\n",
++                src0->name, ids->ne[1], assigned, bins[0], bins[1], bins[2], bins[3], bins[4]);
++        }
++
+         // MoE routing observation for the llama expert cache
+         {
+             void * moe_obs_ud = NULL;

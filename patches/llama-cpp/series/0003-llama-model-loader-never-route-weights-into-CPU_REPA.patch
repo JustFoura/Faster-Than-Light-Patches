@@ -1,0 +1,48 @@
+From b4dde0132568e4bf0ec68138c9946a8fcc976b43 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 16:52:20 +1300
+Subject: [PATCH 03/18] llama-model-loader: never route weights into CPU_REPACK
+ when mmap is on
+
+With GGML_VK_MOE_HOST_MAX_IDS routing wide-id MUL_MAT_ID away from Vulkan,
+the load-time supports_op probe fails for the Vulkan host buffer and
+select_weight_buft falls through to the CPU extra buffer type: CPU_REPACK,
+which COPIES the tensor (transformed) into anonymous RAM - measured 21600
+MiB for this model's down_exps family, fatal on the 16 GB machine. This,
+not the graph reserve, is the OOM mechanism behind the 09-29 session kills.
+The plain CPU buffer wraps the mapped pages zero-copy and the CPU vec_dot
+kernels handle every quant type; reroute to it when mmap is on.
+---
+ src/llama-model-loader.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 91bb5e7cc..5decd50ff 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1269,6 +1269,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             buft = ggml_backend_dev_buffer_type(cpu_dev);
+         }
+ 
++        // same rule for CPU extra buffer types: a repack buffer materializes a
++        // transformed COPY of the tensor in anonymous RAM (measured 21600 MiB
++        // for this model's down_exps family - the 09-29 session kills), which
++        // is pointless when the plain CPU buffer can wrap the mapped pages for
++        // the same kernels. CPU_Mapped and CPU_REPACK are distinct static
++        // types, so the name check is what separates them here.
++        if (use_mmap && buft && ggml_backend_buft_is_host(buft)
++                && buft != ggml_backend_cpu_buffer_type()
++                && strstr(ggml_backend_buft_name(buft), "REPACK") != nullptr) {
++            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (!cpu_dev) {
++                throw std::runtime_error("no CPU backend found");
++            }
++            buft = ggml_backend_dev_buffer_type(cpu_dev);
++        }
++
+         if (buft != buft_list->front().second) {
+             if (n_tensors_moved == 0) {
+                 first_tensor_moved_name = t_meta->name;
+-- 
+2.55.0
+

@@ -1,0 +1,627 @@
+From 2fc48d245faca37e40952a8c94f5c2078426b82c Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Thu, 1 Oct 2026 22:02:10 +1300
+Subject: [PATCH 13/18] Staging gate fix + copy read-ahead (prefill wall root
+ cause); land the day's env-gated decode experiments
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Evening root cause: with --cpu-moe + mmap the expert weights live in
+CPU_Mapped buffers (a plain file mmap). The graph scheduler copies every
+expert tensor into a device buffer BEFORE each prompt-pass mul_mat_id —
+~77 GB per one-pass prefill through fully synchronous per-tensor writes
+whose mmap read side sustains only ~0.9 GB/s (GPU busy 45%, CPU 0.9 cores;
+ubatch sweep read volumes 77/138/259 GB at 16384/8192/4096 = copies per
+pass). The device-staging gate qualified src0 via the pinned-memory lookup,
+which cannot see CPU_Mapped pointers, so staging silently skipped 100% of
+ops (143k major faults with the flag on) and the 09-29 'compute-bound'
+verdict measured a no-op. Fix: qualify on host-backed src0 and stage from
+the raw pointer; broken-flag fallback when staging buffers cannot allocate.
+Also: rolling POSIX_FADV_WILLNEED copy read-ahead in
+ggml_backend_vk_buffer_set_tensor (LLAMA_VK_COPY_READAHEAD_MB, default
+1536, 0=off) — parity byte-identical, measured neutral so far (the window
+is file-adjacent while the sched copies are graph-ordered); one-time
+stage-gate instrumentation line kept for the next pass.
+
+Also lands the day session's env-gated experiments (documented in
+bench-results-2026-10-01/FINDINGS.md): LLAMA_MOE_MISS_PREFETCH (loss),
+LLAMA_MOE_FANOUT_PIPE (neutral), LLAMA_MOE_PROMPT_PREREAD (neutral — its
+registry only fills from CPU mul_mat_id, which never runs at prompt
+widths), LLAMA_VK_MOE_DEVICE_STAGE (the no-op analyzed above).
+---
+ ggml/src/ggml-cpu/ggml-cpu.c         | 162 ++++++++++++++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 298 +++++++++++++++++++++++++++
+ 2 files changed, 453 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2e35bb382..77fd9eaad 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1685,6 +1685,83 @@ static const struct ggml_moe_pread_file * ggml_moe_pread_resolve(const void * ad
+     return NULL;
+ }
+ 
++// ---- prompt-phase expert pre-reader (LLAMA_MOE_PROMPT_PREREAD=1) ----
++// At prompt widths the expert matmuls execute on the GPU over the imported
++// host mapping, and the shaders fault expert pages as they consume them.
++// Within one layer the fault set is that layer's whole expert range (~1.3
++// GiB across gate/up/down), so issuing async WILLNEED reads for layer N+1's
++// (and N+2's) ranges while the graph computes layer N converts the random
++// fault stream into page-cache hits. One layer of reading (~0.3 s at the
++// drive's sequential rate) hides under the next layer's ~2 s wall.
++//
++// The registry fills from the mul_mat_id warmup pass (every layer's gate/up/
++// down stream through the CPU node at reserve/warmup shapes); the kick fires
++// from CPU MUL_MAT nodes, which run per layer at prompt widths only (gated
++// on the activation row count).
++static struct ggml_moe_prereg {
++    const void * base;
++    size_t len;
++    const struct ggml_moe_pread_file * pf;
++} g_moe_prereg[64][3];
++static int g_moe_prereg_layers = 0;
++
++static void ggml_moe_prereg_record(int il, int kind, const void * base, size_t len) {
++    if (il < 0 || il >= 64 || kind < 0 || kind >= 3) {
++        return;
++    }
++    if (g_moe_prereg[il][kind].base == base && g_moe_prereg[il][kind].len == len) {
++        return;
++    }
++    g_moe_prereg[il][kind].base = base;
++    g_moe_prereg[il][kind].len  = len;
++    g_moe_prereg[il][kind].pf   = ggml_moe_pread_resolve(base);
++    if (il + 1 > g_moe_prereg_layers) {
++        g_moe_prereg_layers = il + 1;
++    }
++}
++
++static void ggml_moe_preread_kick(const struct ggml_tensor * node) {
++    static int done = 0;
++    static int on = 0;
++    static long long kick_ms[64];
++    if (!done) {
++        const char * e = getenv("LLAMA_MOE_PROMPT_PREREAD");
++        on = (e && e[0] == '1');
++        done = 1;
++    }
++    if (!on || g_moe_prereg_layers == 0) {
++        return;
++    }
++    // prompt-shaped only: at decode widths the CPU kernel reads exactly via
++    // the fanout pool and readahead is deliberately off
++    if (node->src[1] == NULL || node->src[1]->ne[1] <= 4) {
++        return;
++    }
++    const char * nm = node->src[0] ? node->src[0]->name : "";
++    const char * blk = strstr(nm, "blk.");
++    if (blk == NULL) {
++        return;
++    }
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    const long long now = ts.tv_sec * 1000ll + ts.tv_nsec / 1000000;
++    const int il = atoi(blk + 4);
++    for (int n = il + 1; n <= il + 2 && n < g_moe_prereg_layers; ++n) {
++        if (now - kick_ms[n] < 250) {
++            continue; // one refresh per layer quarter-wall is plenty
++        }
++        kick_ms[n] = now;
++        for (int k = 0; k < 3; ++k) {
++            const struct ggml_moe_prereg * r = &g_moe_prereg[n][k];
++            if (r->base != NULL && r->pf != NULL && r->len > 0) {
++                posix_fadvise(r->pf->fd,
++                        (off_t) (r->pf->map_off + ((const char *) r->base - (const char *) r->pf->map_start)),
++                        (off_t) r->len, POSIX_FADV_WILLNEED);
++            }
++        }
++    }
++}
++
+ // page in one slice: exact-size pread when a model mapping was resolved,
+ // else a one-byte-per-page touch walk to fault it in.
+ static void ggml_moe_fanout_touch_slice(const struct ggml_moe_fanout_slice * s,
+@@ -1823,6 +1900,9 @@ static struct {
+     bool            disabled;  // pool start failed; stay on the legacy path
+     bool            shutdown;
+     bool            node_log;  // GGML_MOE_NODE_LOG=1: per-node phase lines
++    bool            pipe;      // LLAMA_MOE_FANOUT_PIPE=1: two worker groups
++                               // drain alternate jobs (pipeline across jobs)
++    int             gsize[2];  // workers per group
+     int             submitted;
+     struct ggml_moe_fanout_job jobs[GGML_MOE_FANOUT_RING];
+ } g_moe_pool = {
+@@ -1832,19 +1912,31 @@ static struct {
+ };
+ 
+ static void * ggml_moe_fanout_pool_worker(void * arg) {
+-    (void) arg;
++    // Worker group: 0 for every worker in legacy mode (g=0 makes the index
++    // math below identical to the old per-worker `done` sequence); t%2 when
++    // pipelining, so two independent groups drain alternate jobs and the
++    // pread stream stays deep across job boundaries instead of emptying
++    // between one job's last slice and the next job's submit.
++    const int g = (int) (intptr_t) arg;
++    // pipelining is decided once at pool start, before any worker spawns;
++    // legacy mode (pipe=false, all workers g=0) must index jobs 0,1,2,...
++    // exactly as before — the 2*done+g stride is only for the two-group mode
++    const bool pipe = g_moe_pool.pipe;
+     char * scratch = NULL;
+     size_t scratch_n = 0;
+-    int done = 0; // jobs this worker has fully passed
++    int done = 0; // jobs this worker has fully passed (of its group)
+     pthread_mutex_lock(&g_moe_pool.mu);
+     for (;;) {
+-        while (!g_moe_pool.shutdown && done >= g_moe_pool.submitted) {
++        while (!g_moe_pool.shutdown &&
++                (pipe ? 2 * done + g : done) >= g_moe_pool.submitted) {
+             pthread_cond_wait(&g_moe_pool.cv_work, &g_moe_pool.mu);
+         }
+-        if (g_moe_pool.shutdown && done >= g_moe_pool.submitted) {
++        if (g_moe_pool.shutdown &&
++                (pipe ? 2 * done + g : done) >= g_moe_pool.submitted) {
+             break;
+         }
+-        struct ggml_moe_fanout_job * j = &g_moe_pool.jobs[done % GGML_MOE_FANOUT_RING];
++        struct ggml_moe_fanout_job * j =
++            &g_moe_pool.jobs[(pipe ? 2 * done + g : done) % GGML_MOE_FANOUT_RING];
+         pthread_mutex_unlock(&g_moe_pool.mu);
+         ggml_moe_fanout_drain(&j->c, &scratch, &scratch_n);
+         pthread_mutex_lock(&g_moe_pool.mu);
+@@ -1881,12 +1973,19 @@ static bool ggml_moe_fanout_pool_submit(struct ggml_moe_fanout_slice * sl,
+         return false;
+     }
+     if (!g_moe_pool.started) {
++        const char * pe = getenv("LLAMA_MOE_FANOUT_PIPE");
++        // one worker cannot split into two groups (a job in the empty group
++        // would start with active == 0 and never free its ring slot)
++        g_moe_pool.pipe = (pe && pe[0] == '1') && n_threads >= 2;
+         g_moe_pool.started = true;
+         g_moe_pool.n_threads = n_threads;
+         int started = 0;
+         for (int t = 0; t < n_threads; ++t) {
+-            if (pthread_create(&g_moe_pool.tid[t], NULL, ggml_moe_fanout_pool_worker, NULL) == 0) {
++            const int g = g_moe_pool.pipe ? t % 2 : 0;
++            if (pthread_create(&g_moe_pool.tid[t], NULL, ggml_moe_fanout_pool_worker,
++                        (void *) (intptr_t) g) == 0) {
+                 started++;
++                g_moe_pool.gsize[g_moe_pool.pipe ? t % 2 : 0]++;
+             }
+         }
+         if (started == 0) {
+@@ -1914,7 +2013,8 @@ static bool ggml_moe_fanout_pool_submit(struct ggml_moe_fanout_slice * sl,
+     j->c.pg   = pg;
+     j->c.pf   = pf;
+     atomic_init(&j->c.next, 0);
+-    atomic_store_explicit(&j->active, g_moe_pool.n_threads, memory_order_seq_cst);
++    const int g_j = g_moe_pool.pipe ? (g_moe_pool.submitted % 2) : 0;
++    atomic_store_explicit(&j->active, g_moe_pool.gsize[g_j], memory_order_seq_cst);
+     j->in_use = true;
+     g_moe_pool.submitted++;
+     if (job_out) {
+@@ -2358,6 +2458,10 @@ static void ggml_compute_forward_mul_mat_id(
+                 g_moe_sib[sib_il][sib_kind].base = src0->data;
+                 g_moe_sib[sib_il][sib_kind].nb02 = (size_t) nb02;
+                 g_moe_sib[sib_il][sib_kind].has = 1;
++                // prompt pre-reader registry: full tensor extent, resolved
++                // against the model mapping for async WILLNEED reads
++                ggml_moe_prereg_record(sib_il, sib_kind, src0->data,
++                        (size_t) ggml_nbytes(src0));
+             }
+         }
+         const int sib_covered = sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind > 0
+@@ -2462,8 +2566,29 @@ static void ggml_compute_forward_mul_mat_id(
+             }
+         }
+         if (n_sl > 0) {
++            // one-layer-ahead miss prefetch (LLAMA_MOE_MISS_PREFETCH=1):
++            // per-layer slots hold the previous pass's merged miss-slice list;
++            // at each layer's gate op the NEXT layer's saved list is submitted
++            // as a fire-and-forget pool job, so the repeated slice set (W=1
++            // temporal reuse ~39-47% of routes) is page-cache-resident when
++            // that layer's real merged job drains. Decode/verify widths only.
++            // Thread 0 owns the slots; workers only see the job's own copy.
++            #define GGML_MOE_PF_LAYERS 64
++            #define GGML_MOE_PF_MAX 512
++            static struct ggml_moe_pf_slot {
++                struct ggml_moe_fanout_slice sl[GGML_MOE_PF_MAX];
++                int n;
++                const struct ggml_moe_pread_file * pf;
++            } g_moe_pf_prev[GGML_MOE_PF_LAYERS];
+             static int moe_pread_done = 0;
+             static int moe_pread_on = 0;
++            static int moe_pf_done = 0;
++            static int moe_pf_on = 0;
++            if (!moe_pf_done) {
++                const char * pf_e = getenv("LLAMA_MOE_MISS_PREFETCH");
++                moe_pf_on = (pf_e && pf_e[0] == '1');
++                moe_pf_done = 1;
++            }
+             if (!moe_pread_done) {
+                 const char * e = getenv("LLAMA_MOE_PREAD");
+                 moe_pread_on = (e && e[0] == '1');
+@@ -2511,6 +2636,28 @@ static void ggml_compute_forward_mul_mat_id(
+             }
+             // dispatched: ownership of sl moved to the pool job; the last pool
+             // worker to pass the job frees it.
++            if (dispatched && moe_pf_on && moe_decode_phase && sib_il >= 0 && sib_kind == 0) {
++                // save this pass's merged miss list for the next pass, then
++                // prefetch the next layer's saved list; ring-FIFO places the
++                // prefetch job right after this layer's real job, so it drains
++                // during this layer's compute + the next layer's attention.
++                struct ggml_moe_pf_slot * slot = &g_moe_pf_prev[sib_il % GGML_MOE_PF_LAYERS];
++                slot->n = n_sl < GGML_MOE_PF_MAX ? n_sl : GGML_MOE_PF_MAX;
++                memcpy(slot->sl, sl, sizeof(slot->sl[0]) * slot->n);
++                slot->pf = pf;
++                struct ggml_moe_pf_slot * nxt = &g_moe_pf_prev[(sib_il + 1) % GGML_MOE_PF_LAYERS];
++                if (nxt->n > 0 && nxt->pf) {
++                    struct ggml_moe_fanout_slice * psl = (struct ggml_moe_fanout_slice *)
++                        malloc(sizeof(psl[0]) * nxt->n);
++                    if (psl) {
++                        memcpy(psl, nxt->sl, sizeof(psl[0]) * nxt->n);
++                        if (!ggml_moe_fanout_pool_submit(psl, nxt->n, pg, nxt->pf,
++                                moe_fanout_n, NULL)) {
++                            free(psl);
++                        }
++                    }
++                }
++            }
+         } else {
+             free(sl);
+             if (moe_fanout_n == 0) {
+@@ -2775,6 +2922,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             } break;
+         case GGML_OP_MUL_MAT:
+             {
++                ggml_moe_preread_kick(tensor);
+                 ggml_compute_forward_mul_mat(params, tensor);
+             } break;
+         case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e61f041cc..f2fb0cdeb 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -67,6 +67,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include <future>
+ #include <condition_variable>
+ #include <thread>
++#include <fcntl.h>
+ 
+ #if defined(_MSC_VER)
+ # define NOMINMAX 1
+@@ -10218,6 +10219,105 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
+     }
+ }
+ 
++// ---- LLAMA_VK_MOE_DEVICE_STAGE --------------------------------------------
++// Prompt-width expert matmuls read weights from host-imported memory through
++// the GPU fault path, which saturates near ~1 GB/s regardless of drive. With
++// this mode the tensor is read CPU-side instead (plain sequential memcpy —
++// the kernel readahead runs at the drive's full rate), uploaded to a device
++// scratch, and the matmul binds the device copy. The memcpy for the next
++// expert node runs on a staging thread while the current node's upload and
++// compute execute on the GPU, so staging hides under the shader.
++static vk_buffer ggml_vk_create_buffer_hostmem(vk_device& device, size_t size);
++
++struct vk_moe_stage_state {
++    bool inited = false;
++    bool on = false;
++    bool broken = false;            // buffer alloc failed once; stay on the fault path
++    int parity = 0;                 // slot used by the most recent staged node
++    bool have_job = false;          // memcpy in flight or pending
++    bool job_done = true;
++    const void * job_src = nullptr; // identifies the tensor the job staged
++    size_t job_len = 0;
++    int job_slot = 0;
++    bool bind_active = false;       // current node binds the staged copy
++    int bind_slot = 0;
++    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
++    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
++    pthread_t thread;
++    bool thread_started = false;
++    vk_buffer host[2];
++    vk_buffer dev[2];
++    size_t cap[2] = {0, 0};
++};
++static vk_moe_stage_state g_moe_stage;
++
++static void * ggml_vk_moe_stage_thread(void *) {
++    for (;;) {
++        pthread_mutex_lock(&g_moe_stage.mu);
++        while (!g_moe_stage.have_job) {
++            pthread_cond_wait(&g_moe_stage.cv, &g_moe_stage.mu);
++        }
++        const void * src = g_moe_stage.job_src;
++        const size_t len = g_moe_stage.job_len;
++        const int slot = g_moe_stage.job_slot;
++        void * dst = g_moe_stage.host[slot]->ptr;
++        g_moe_stage.have_job = false;  // taken; a new kick may be queued
++        pthread_mutex_unlock(&g_moe_stage.mu);
++
++        memcpy(dst, src, len);
++
++        pthread_mutex_lock(&g_moe_stage.mu);
++        g_moe_stage.job_done = true;
++        pthread_cond_broadcast(&g_moe_stage.cv);
++        pthread_mutex_unlock(&g_moe_stage.mu);
++    }
++    return nullptr;
++}
++
++static void ggml_vk_moe_stage_ensure(vk_device& device, int slot, size_t len) {
++    if (g_moe_stage.cap[slot] >= len) {
++        return;
++    }
++    if (g_moe_stage.cap[slot] > 0) {
++        g_moe_stage.host[slot] = nullptr;  // vk_buffer_struct frees on reset
++        g_moe_stage.dev[slot] = nullptr;
++    }
++    try {
++        g_moe_stage.host[slot] = ggml_vk_create_buffer_hostmem(device, len);
++        g_moe_stage.dev[slot] = ggml_vk_create_buffer_check(device, len,
++                vk::MemoryPropertyFlagBits::eDeviceLocal);
++        g_moe_stage.cap[slot] = len;
++    } catch (const std::exception& e) {
++        // VRAM/RAM too tight for a staging slot: disable staging for this run
++        // and keep serving through the fault path instead of dying mid-graph.
++        GGML_LOG_WARN("ggml_vulkan: MoE device staging disabled, buffer alloc failed (%s)\n", e.what());
++        g_moe_stage.host[slot] = nullptr;
++        g_moe_stage.dev[slot] = nullptr;
++        g_moe_stage.cap[slot] = 0;
++        g_moe_stage.broken = true;
++    }
++}
++
++// true when the node is a prompt-width expert matmul on host-imported weights
++static bool ggml_vk_moe_stage_qualifies(const ggml_tensor * node) {
++    if (node->op != GGML_OP_MUL_MAT_ID || node->src[1] == nullptr ||
++            node->src[1]->ne[1] <= 4 || node->src[0] == nullptr) {
++        return false;
++    }
++    if (ggml_nbytes(node->src[0]) > 512ull * 1024 * 1024) {
++        return false;
++    }
++    return strstr(node->src[0]->name, "_exps") != nullptr;
++}
++
++static void ggml_vk_moe_stage_wait_done() {
++    pthread_mutex_lock(&g_moe_stage.mu);
++    while (!g_moe_stage.job_done) {
++        pthread_cond_wait(&g_moe_stage.cv, &g_moe_stage.mu);
++    }
++    pthread_mutex_unlock(&g_moe_stage.mu);
++}
++
+ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+@@ -10445,6 +10545,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         qx_buf_offset = vk_tensor_offset(src0) + src0->view_offs;
+         GGML_ASSERT(d_Qx != nullptr);
+     }
++    if (g_moe_stage.bind_active) {
++        // device staging: the staging thread has already memcpy'd this
++        // tensor's bytes into the host slot (LLAMA_VK_MOE_DEVICE_STAGE).
++        // Upload host → device synchronously — completing the upload before
++        // returning keeps every later slot reuse trivially ordered — then
++        // bind the device copy instead of the host-imported weights.
++        const int slot = g_moe_stage.bind_slot;
++        ggml_vk_buffer_copy(g_moe_stage.dev[slot], 0,
++                            g_moe_stage.host[slot], 0, g_moe_stage.cap[slot]);
++        d_Qx = g_moe_stage.dev[slot];
++        qx_buf_offset = 0;
++        g_moe_stage.bind_active = false;
++    }
+     if (!src1_uma) {
+         d_Qy = src1_buf_ctx->dev_buffer;
+         qy_buf_offset = vk_tensor_offset(src1) + src1->view_offs;
+@@ -10831,6 +10944,89 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
+     ggml_tensor * src1 = dst->src[1];
+     ggml_tensor * src2 = dst->src[2];
+     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
++    if (!g_moe_stage.inited) {
++        const char * e = getenv("LLAMA_VK_MOE_DEVICE_STAGE");
++        g_moe_stage.on = (e && e[0] == '1');
++        g_moe_stage.inited = true;
++    }
++    if (g_moe_stage.on && !g_moe_stage.broken &&
++            !ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) &&
++            ggml_vk_moe_stage_qualifies(dst)) {
++        vk_buffer tmp = nullptr;
++        size_t tmpoff = 0;
++        // 10-01 fix: with --load-mode mmap the expert weights live in
++        // CPU_Mapped buffers (a plain file mmap), which the pinned_memory
++        // lookup cannot see — host_get returned null and staging silently
++        // skipped every op (major-fault counts identical on/off). Qualify on
++        // host-backed src0 instead and stage from the raw pointer, which the
++        // copies below already read.
++        bool stageable = false;
++        if (src0->buffer != nullptr &&
++                ggml_backend_buft_is_host(src0->buffer->buft)) {
++            stageable = true;
++        } else {
++            ggml_vk_host_get(ctx->device, src0->data, tmp, tmpoff);
++            stageable = tmp != nullptr;
++        }
++        static bool stage_gate_logged = false;
++        if (!stage_gate_logged) {
++            stage_gate_logged = true;
++            GGML_LOG_WARN("ggml_vulkan: stage-gate src0='%s' buft='%s' nbytes=%lli is_host=%d pinned=%d n_ids=%lli stageable=%d\n",
++                    src0->name,
++                    src0->buffer != nullptr ? ggml_backend_buft_name(src0->buffer->buft) : "(null)",
++                    (long long) ggml_nbytes(src0),
++                    (int) (src0->buffer != nullptr && ggml_backend_buft_is_host(src0->buffer->buft)),
++                    (int) (tmp != nullptr),
++                    (long long) (src2 ? src2->ne[1] : -1),
++                    (int) stageable);
++        }
++        if (stageable) {
++            if (!g_moe_stage.thread_started) {
++                g_moe_stage.thread_started = true;
++                pthread_create(&g_moe_stage.thread, nullptr, ggml_vk_moe_stage_thread, nullptr);
++            }
++            ggml_vk_moe_stage_wait_done();
++            const bool cold = !(g_moe_stage.job_src == src0->data &&
++                    (size_t) g_moe_stage.job_len == (size_t) ggml_nbytes(src0));
++            if (!cold) {
++                // the lookahead job staged this exact tensor
++                ggml_vk_moe_stage_ensure(ctx->device, g_moe_stage.job_slot, g_moe_stage.job_len);
++                g_moe_stage.bind_slot = g_moe_stage.job_slot;
++            } else {
++                // cold start (first expert node of a pass): stage inline
++                g_moe_stage.bind_slot = g_moe_stage.parity;
++                ggml_vk_moe_stage_ensure(ctx->device, g_moe_stage.bind_slot, ggml_nbytes(src0));
++            }
++            if (g_moe_stage.host[g_moe_stage.bind_slot] != nullptr) {
++                if (cold) {
++                    memcpy(g_moe_stage.host[g_moe_stage.bind_slot]->ptr, src0->data, ggml_nbytes(src0));
++                }
++                g_moe_stage.parity = g_moe_stage.bind_slot;
++                g_moe_stage.bind_active = true;
++                // kick the staging thread on the next expert tensor
++                for (int j = node_idx + 1; j < (int) cgraph->n_nodes && j <= node_idx + 32; ++j) {
++                    ggml_tensor * n = cgraph->nodes[j];
++                    if (n->op == GGML_OP_MUL_MAT_ID) {
++                        if (ggml_vk_moe_stage_qualifies(n) && !g_moe_stage.broken) {
++                            const int nslot = g_moe_stage.bind_slot ^ 1;
++                            ggml_vk_moe_stage_ensure(ctx->device, nslot, (size_t) ggml_nbytes(n->src[0]));
++                            if (g_moe_stage.host[nslot] != nullptr) {
++                                pthread_mutex_lock(&g_moe_stage.mu);
++                                g_moe_stage.job_src = n->src[0]->data;
++                                g_moe_stage.job_len = (size_t) ggml_nbytes(n->src[0]);
++                                g_moe_stage.job_slot = nslot;
++                                g_moe_stage.job_done = false;
++                                g_moe_stage.have_job = true;
++                                pthread_cond_broadcast(&g_moe_stage.cv);
++                                pthread_mutex_unlock(&g_moe_stage.mu);
++                            }
++                        }
++                        break;
++                    }
++                }
++            }
++        }
++    }
+     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+@@ -16452,6 +16648,104 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
+     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+ }
+ 
++// ---- large-copy read-ahead (2026-10-01) ------------------------------------
++// The graph scheduler copies every expert weight from its CPU_Mapped home
++// (a plain mmap of the GGUF) into a device buffer before each prompt-pass
++// mul_mat_id — 144 tensors x ~450 MB at one-pass prefill, ~77 GB per pass.
++// Each copy runs through ggml_vk_buffer_write_2d fully synchronously, and
++// its mmap read side (queue-depth-1 page faults) sustained only ~0.9 GB/s —
++// that, not the MoE shader, is the dominant prefill wall (GPU busy ~45%,
++// CPU ~1 core during the pass; ubatch sweep read volumes 77/138/259 GB match
++// copies-per-pass exactly). Advising the kernel to page the NEXT window of
++// the file ahead of the copy cursor turns every read into a page-cache hit.
++// No tensor bytes change, so outputs stay byte-identical.
++static void ggml_vk_mmap_readahead_ahead(const void * src, size_t size) {
++    static std::mutex mu;
++    std::lock_guard<std::mutex> guard(mu);
++    struct vk_ra_map {
++        const char * base;
++        const char * end;
++        int fd;
++        off_t map_off;
++    };
++    static vk_ra_map maps[8];
++    static int maps_n = 0;
++    static long window_mb = -1;
++    if (window_mb < 0) {
++        const char * e = getenv("LLAMA_VK_COPY_READAHEAD_MB");
++        window_mb = e && e[0] ? atol(e) : 1536;
++    }
++    if (window_mb == 0) {
++        return;
++    }
++    const char * p = (const char *) src + size;
++    const vk_ra_map * m = nullptr;
++    for (int i = 0; i < maps_n; ++i) {
++        if (p >= maps[i].base && p < maps[i].end) {
++            m = &maps[i];
++            break;
++        }
++    }
++    if (m == nullptr) {
++        if (maps_n >= 8) {
++            return;
++        }
++        FILE * f = fopen("/proc/self/maps", "r");
++        if (f == NULL) {
++            return;
++        }
++        char line[1024];
++        const uintptr_t want = (uintptr_t) p;
++        while (fgets(line, sizeof(line), f)) {
++            uintptr_t lo = 0, hi = 0;
++            char perms[8] = {0};
++            unsigned long long off = 0;
++            unsigned int devmaj = 0, devmin = 0;
++            long inode = 0;
++            if (sscanf(line, "%lx-%lx %7s %llx %x:%x %li",
++                       &lo, &hi, perms, &off, &devmaj, &devmin, &inode) != 7 ||
++                    inode == 0 || perms[0] != 'r' || want < lo || want >= hi) {
++                continue;
++            }
++            const char * path = strchr(line, '/');
++            if (path == NULL) {
++                continue;
++            }
++            char pathbuf[768];
++            size_t plen = strcspn(path, "\n");
++            if (plen == 0 || plen >= sizeof(pathbuf)) {
++                continue;
++            }
++            memcpy(pathbuf, path, plen);
++            pathbuf[plen] = '\0';
++            int fd = open(pathbuf, O_RDONLY);
++            if (fd < 0) {
++                continue;
++            }
++            vk_ra_map * nm = &maps[maps_n++];
++            nm->base = (const char *) lo;
++            nm->end = (const char *) hi;
++            nm->fd = fd;
++            nm->map_off = (off_t) off;
++            m = nm;
++            break;
++        }
++        fclose(f);
++        if (m == nullptr) {
++            return;
++        }
++    }
++    const char * wstart = p;
++    const char * wend = p + (size_t) window_mb * (1ull << 20);
++    if (wend > m->end) {
++        wend = m->end;
++    }
++    if (wend > wstart) {
++        posix_fadvise(m->fd, m->map_off + (wstart - m->base), wend - wstart,
++                POSIX_FADV_WILLNEED);
++    }
++}
++
+ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
+     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+@@ -16461,6 +16755,10 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
+         return;
+     }
+ 
++    if (size >= (64ull << 20)) {
++        ggml_vk_mmap_readahead_ahead(data, size);
++    }
++
+     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+ }
+ 
+-- 
+2.55.0
+

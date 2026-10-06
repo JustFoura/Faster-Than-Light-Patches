@@ -1,0 +1,111 @@
+--- a/ggml/src/ggml-cpu/ggml-cpu.c	2026-09-27 18:18:44.297384567 +1300
++++ b/ggml/src/ggml-cpu/ggml-cpu.c	2026-09-27 18:36:48.394606380 +1300
+@@ -1614,6 +1614,79 @@
+     return NULL;
+ }
+ 
++// GGML_MOE_MMAP_DONTNEED: release routed expert pages after the op computes
++// them (bounded page-cache window for SSD-offloaded experts). Inactive unless
++// set to exactly "1".
++static bool ggml_cpu_mmid_page_release_enabled(void) {
++    const char * value = getenv("GGML_MOE_MMAP_DONTNEED");
++    return value != NULL && value[0] == '1' && value[1] == '\0';
++}
++
++// MADV_DONTNEED on a private anonymous mapping zeroes the pages, so only ever
++// drop ranges that live in a file-backed mapping. Each distinct base pointer
++// is checked once against /proc/self/maps and the verdict is cached; every
++// expert tensor of a GGUF shares one mapping, so the common case is one walk
++// per tensor for the whole process lifetime. Caches are read-only after init
++// and the single writer runs on the main compute thread, so no lock is needed.
++static bool ggml_cpu_range_is_file_backed(const void * addr, size_t size) {
++    struct ggml_cpu_fb_entry { const void * key; bool val; };
++    static struct ggml_cpu_fb_entry cache[512];
++    static size_t cache_n = 0;
++    static bool cache_full = false;
++
++    if (!cache_full) {
++        for (size_t i = 0; i < cache_n; ++i) {
++            if (cache[i].key == addr) {
++                return cache[i].val;
++            }
++        }
++    } else {
++        for (size_t i = 0; i < 512; ++i) {
++            if (cache[i].key == addr) {
++                return cache[i].val;
++            }
++        }
++    }
++
++    bool file_backed = false;
++    FILE * f = fopen("/proc/self/maps", "r");
++    if (f) {
++        char line[512];
++        const uintptr_t want_lo = (uintptr_t) addr;
++        const uintptr_t want_hi = want_lo + size;
++        while (fgets(line, sizeof(line), f)) {
++            uintptr_t lo = 0, hi = 0;
++            // format: start-end perms offset dev inode [path]
++            if (sscanf(line, "%lx-%lx", &lo, &hi) != 2) {
++                continue;
++            }
++            if (want_lo >= lo && want_hi <= hi) {
++                // inode field is the 5th token; a nonzero inode means file-backed
++                const char * p = strchr(line, ' ');
++                int spaces = 0;
++                while (p && spaces < 4) {
++                    p = strchr(p + 1, ' ');
++                    ++spaces;
++                }
++                file_backed = p != NULL && strtol(p + 1, NULL, 10) != 0;
++                break;
++            }
++        }
++        fclose(f);
++    }
++
++    if (!cache_full) {
++        if (cache_n < 512) {
++            cache[cache_n].key = addr;
++            cache[cache_n].val = file_backed;
++            ++cache_n;
++        } else {
++            cache_full = true;
++        }
++    }
++    return file_backed;
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1952,6 +2025,28 @@
+             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+         }
+     }
++
++    // Optional page-cache release after the node. On host-offloaded MoE models
++    // the routed expert working set is far larger than the RAM left for the
++    // page cache, so leaving pages to the LRU makes each ubatch re-fault the
++    // same ranges several times. Dropping the routed expert pages once every
++    // thread is done keeps the cache bounded and turns the next pass into one
++    // clean stream. Only file-backed shared ranges are ever madvise'd: for a
++    // private anonymous mapping MADV_DONTNEED would zero the data.
++    ggml_barrier(params->threadpool);
++    if (ith == 0 && ggml_cpu_mmid_page_release_enabled()) {
++        const long pg = sysconf(_SC_PAGESIZE);
++        if (pg > 0 && ggml_cpu_range_is_file_backed(src0->data, (size_t) (src0->nb[2] * n_as))) {
++            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                if (matrix_row_counts[cur_a] == 0) {
++                    continue;
++                }
++                char * p = (char *) src0->data + cur_a * nb02;
++                char * pb = (char *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
++                madvise((void *) pb, (size_t) (p - pb) + (size_t) nb02, MADV_DONTNEED);
++            }
++        }
++    }
+ }
+ 
+ /////////////////////////////////

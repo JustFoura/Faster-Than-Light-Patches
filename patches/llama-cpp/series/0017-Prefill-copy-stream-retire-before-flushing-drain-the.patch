@@ -1,0 +1,347 @@
+From 81667e532b1f5ba46dd7ee916e486eaf8d948e62 Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Fri, 2 Oct 2026 16:03:02 +1300
+Subject: [PATCH 17/18] Prefill copy stream: retire before flushing, drain the
+ batch concurrently
+
+Picks up the win the copy-pool commit had already written off. Prefill goes
+172 -> 202 t/s (+17%) with parity byte-identical on every arm.
+
+1. reserve() flushed before it retired. At the moment the pool ran dry,
+   copy_batch held exactly one un-submitted slot, so every reclaim pushed a
+   one-member batch: avg_batch was pinned at 1 by the recovery path itself.
+   Retire the oldest in-flight batch first and only submit the open batch when
+   nothing is left in flight to reclaim. avg_batch 1.1 -> 7.7, blocked 12,632
+   -> 1,777.
+
+   This falsifies "copies and compute contexts alternate ~1:1, there is no bulk
+   copy phase". The flush blamed for it (get_compute_ctx, ~7,420 calls/pass,
+   one per graph node) is a no-op -- the scheduler issues every copy between
+   graph computes, so copy_batch is empty during node iteration. flush_by
+   counters now prove the distribution: get_compute_ctx=0, batch_full=1650.
+
+2. Drain a whole batch concurrently. in_memcpys were drained one memcpy at a
+   time, a queue-depth-1 fault stream, while a batch already holds up to
+   copy_batch_max independent copies each writing its own staging slot.
+   LLAMA_VK_COPY_DRAIN_THREADS (default 8; 1 = old sequential drain).
+   170.5/141.3 t/s -> 188.7/183.0 t/s order-controlled. 16+ threads regress
+   on 8 physical cores.
+
+3. Drop the 4 MiB pread floor to 256 KiB. The floor excluded most of the
+   stream -- the copy histogram averages 3.4 MB -- and was set when each copy
+   paid for its own thread setup, which a batched drain now amortises.
+   LLAMA_VK_COPY_PREAD_MIN_KB. 177.5/193.7 -> 202.2/201.3 t/s, drain rate
+   2.5-2.7 -> 3.2 GB/s.
+
+Also adds flush_by attribution counters, drain/retire/bytes accounting, and
+fixes the harness's gpu_busy seconds print (ms/s mixed).
+
+The pass is now 74 s = 48.8 s GPU busy + 14.8 s drain + ~10 s other, and
+retire_fence is 0.0 s on every arm -- the copy path no longer blocks on the
+GPU. 14,960 tok / 48.8 s = 306 t/s is the GPU floor, so the remaining gap to
+the 300 target is entirely the drain still sitting on the critical path.
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 174 ++++++++++++++++++++++++---
+ 1 file changed, 155 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index cf8fd7047..a6e515761 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -419,10 +419,27 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+ static bool ggml_vk_copy_pool_enabled();
+ static void ggml_vk_copy_pool_init(ggml_backend_vk_context * ctx);
+ static void ggml_vk_copy_pool_destroy(ggml_backend_vk_context * ctx);
+-static void ggml_vk_copy_pool_flush(ggml_backend_vk_context * ctx);
+ static void ggml_vk_copy_pool_retire_oldest(ggml_backend_vk_context * ctx);
+ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx, vk::Fence fence = vk::Fence());
+ 
++// Which call site pushed a copy batch. Flushes happen from five places and only
++// one of them is ever the bottleneck, so counting them apart is the difference
++// between "the copy stream has no bulk phase" and "one call site pushes every
++// batch on its own". Sized here because ggml_vk_copy_pool_destroy reports it.
++enum ggml_vk_flush_reason {
++    GGML_VK_FLUSH_OTHER = 0,
++    GGML_VK_FLUSH_GET_COMPUTE_CTX,  // per graph node
++    GGML_VK_FLUSH_RESERVE,          // pool ran dry
++    GGML_VK_FLUSH_BATCH_FULL,       // copy_batch reached copy_batch_max
++    GGML_VK_FLUSH_SYNCHRONIZE,      // ggml_vk_synchronize
++    GGML_VK_FLUSH_GRAPH_COMPUTE,    // top of graph_compute
++    GGML_VK_FLUSH_EVENT_RECORD,
++    GGML_VK_FLUSH_N,
++};
++static long g_copy_pool_flush_by[GGML_VK_FLUSH_N];
++
++static void ggml_vk_copy_pool_flush(ggml_backend_vk_context * ctx, int reason = 0);
++
+ static constexpr uint32_t mul_mat_vec_max_cols = 8;
+ static constexpr uint32_t p021_max_gqa_ratio = 8;
+ 
+@@ -8398,7 +8415,7 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
+     // right now. Any copy batch still open would be submitted AFTER that value
+     // is captured, so this compute would not wait for it. Push it first.
+     if (!ctx->copy_pool.empty()) {
+-        ggml_vk_copy_pool_flush(ctx);
++        ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_GET_COMPUTE_CTX);
+     }
+ 
+     vk_context result;
+@@ -8508,6 +8525,12 @@ static int ggml_vk_copy_pool_size() {
+ }
+ 
+ static long g_copy_pool_acquires = 0, g_copy_pool_blocked = 0, g_copy_pool_batches = 0;
++// Wall time inside the two places the pooled copy path can block on the host
++// thread: the host read drain (submit_transfer_ctx) and the GPU fence wait
++// (retire_oldest). Their sum against the pass wall time is what says whether
++// copy/compute overlap is actually happening.
++static long g_copy_pool_drain_us = 0, g_copy_pool_retire_us = 0;
++static long g_copy_pool_bytes = 0;
+ 
+ static void ggml_vk_copy_pool_init(ggml_backend_vk_context * ctx) {
+     const int n = ggml_vk_copy_pool_size();
+@@ -8533,7 +8556,7 @@ static void ggml_vk_copy_pool_destroy(ggml_backend_vk_context * ctx) {
+         return;
+     }
+     // Retire everything still outstanding before the slots go away.
+-    ggml_vk_copy_pool_flush(ctx);
++    ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_OTHER);
+     while (!ctx->copy_inflight.empty()) {
+         ggml_vk_copy_pool_retire_oldest(ctx);
+     }
+@@ -8542,6 +8565,20 @@ static void ggml_vk_copy_pool_destroy(ggml_backend_vk_context * ctx) {
+                 g_copy_pool_acquires, g_copy_pool_blocked, g_copy_pool_batches,
+                 g_copy_pool_batches ? (double) g_copy_pool_acquires / g_copy_pool_batches : 0.0,
+                 ctx->copy_pool.size());
++        // Which call site pushed each batch. The 10-02 write-up attributed the
++        // 1-member batches to get_compute_ctx; this shows the real distribution.
++        fprintf(stderr, "[copy-pool] flush_by: get_compute_ctx=%ld reserve=%ld batch_full=%ld"
++                        " synchronize=%ld graph_compute=%ld event_record=%ld\n",
++                g_copy_pool_flush_by[GGML_VK_FLUSH_GET_COMPUTE_CTX],
++                g_copy_pool_flush_by[GGML_VK_FLUSH_RESERVE],
++                g_copy_pool_flush_by[GGML_VK_FLUSH_BATCH_FULL],
++                g_copy_pool_flush_by[GGML_VK_FLUSH_SYNCHRONIZE],
++                g_copy_pool_flush_by[GGML_VK_FLUSH_GRAPH_COMPUTE],
++                g_copy_pool_flush_by[GGML_VK_FLUSH_EVENT_RECORD]);
++        fprintf(stderr, "[copy-pool] drain=%.1fs (%.2f GB/s)  retire_fence=%.1fs  staged=%.1fGB\n",
++                g_copy_pool_drain_us / 1e6,
++                g_copy_pool_drain_us > 0 ? (g_copy_pool_bytes / 1e9) / (g_copy_pool_drain_us / 1e6) : 0.0,
++                g_copy_pool_retire_us / 1e6, g_copy_pool_bytes / 1e9);
+     }
+     for (auto & s : ctx->copy_pool) {
+         ggml_vk_destroy_buffer(s.buf);
+@@ -8558,8 +8595,10 @@ static void ggml_vk_copy_pool_retire_oldest(ggml_backend_vk_context * ctx) {
+         return;
+     }
+     ggml_backend_vk_context::staging_batch & b = ctx->copy_inflight.front();
++    const int64_t t0 = ggml_vk_now_us();
+     VK_CHECK(ctx->device->device.waitForFences({ b.fence }, true, UINT64_MAX),
+              "copy-pool batch fence", ctx->device);
++    g_copy_pool_retire_us += ggml_vk_now_us() - t0;
+     ctx->device->device.resetFences({ b.fence });
+     ctx->device->device.destroyFence(b.fence);
+     for (size_t s : b.slots) {
+@@ -8571,8 +8610,8 @@ static void ggml_vk_copy_pool_retire_oldest(ggml_backend_vk_context * ctx) {
+ // Push the open batch to the GPU: drain the host reads, then ONE submit with
+ // ONE fence covering every slot in the batch. Must be called before any compute
+ // that reads a staged tensor — compute waits on transfer_semaphore, which only
+-// advances on submit.
+-static void ggml_vk_copy_pool_flush(ggml_backend_vk_context * ctx) {
++// advances on submit. `reason` attributes the push to its call site.
++static void ggml_vk_copy_pool_flush(ggml_backend_vk_context * ctx, int reason) {
+     if (ctx->copy_batch.empty()) {
+         return;
+     }
+@@ -8580,8 +8619,14 @@ static void ggml_vk_copy_pool_flush(ggml_backend_vk_context * ctx) {
+     ctx->copy_inflight.push_back({ fence, ctx->copy_batch });
+     ctx->copy_batch.clear();
+     g_copy_pool_batches++;
++    if (reason > GGML_VK_FLUSH_OTHER && reason < GGML_VK_FLUSH_N) {
++        g_copy_pool_flush_by[reason]++;
++    }
+ 
+-    if (!ggml_vk_submit_transfer_ctx(ctx, fence)) {
++    const int64_t t0 = ggml_vk_now_us();
++    const bool ok = ggml_vk_submit_transfer_ctx(ctx, fence);
++    g_copy_pool_drain_us += ggml_vk_now_us() - t0;
++    if (!ok) {
+         // Nothing was submitted: the recorded copyBuffers would never run.
+         // Fall back to the synchronous path so the data still lands.
+         ctx->copy_inflight.pop_back();
+@@ -8603,11 +8648,31 @@ static void ggml_vk_copy_pool_reserve(ggml_backend_vk_context * ctx) {
+             }
+         }
+         g_copy_pool_blocked++;
+-        // Retire the OLDEST in-flight batch: by the time we need a slot, that is
+-        // the one the GPU has had longest to drain. This wait is the only place
+-        // the copy path blocks, and it is what the pool exists to amortize.
+-        ggml_vk_copy_pool_flush(ctx);
+-        ggml_vk_copy_pool_retire_oldest(ctx);
++        // Retire the OLDEST in-flight batch FIRST, and only submit the open batch
++        // when there is nothing left in flight to reclaim.
++        //
++        // Order matters. The previous order was flush-then-retire: at the moment
++        // the pool runs dry, copy_batch holds exactly one un-submitted slot, so
++        // the flush pushed it as a ONE-member batch before reclaiming anything.
++        // That pins the batch size at 1 for every reclaim, which is why the
++        // 10-02 run measured avg_batch 1.1 and blocked 12,632 of 13,716 acquires
++        // — the batch was being destroyed by its own recovery path, not by
++        // anything the caller did. Retiring first lets the open batch keep
++        // accumulating up to copy_batch_max before it is submitted.
++        if (!ctx->copy_inflight.empty()) {
++            // By the time we need a slot, the oldest in-flight batch is the one
++            // the GPU has had longest to drain. This wait is the only place the
++            // copy path blocks, and it is what the pool exists to amortize.
++            ggml_vk_copy_pool_retire_oldest(ctx);
++        } else {
++            // Nothing in flight to reclaim: the open batch is holding every slot,
++            // so it has to be submitted before any of it can be reused.
++            ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_RESERVE);
++            if (ctx->copy_inflight.empty()) {
++                GGML_ABORT("ggml_vk_copy_pool_reserve: no free slot and nothing in flight to reclaim");
++            }
++            ggml_vk_copy_pool_retire_oldest(ctx);
++        }
+     }
+     GGML_ABORT("ggml_vk_copy_pool_reserve: no free slot after retiring every batch");
+ }
+@@ -8630,6 +8695,61 @@ static size_t ggml_vk_copy_slot_take(ggml_backend_vk_context * ctx) {
+     GGML_ABORT("ggml_vk_copy_slot_take: no free slot");
+ }
+ 
++// Run one batch's deferred host->staging reads.
++//
++// Sequentially this is a queue-depth-1 fault stream: one memcpy at a time, each
++// blocking on its own page faults. The batch already holds up to copy_batch_max
++// INDEPENDENT copies (each targets its own staging slot), so running them
++// concurrently multiplies the number of readahead streams the kernel and the
++// drive have in flight. Same bytes into the same staging buffers, so the upload
++// is unchanged.
++//
++// LLAMA_VK_COPY_DRAIN_THREADS=<n>: 1 restores the sequential drain. Default 8.
++static void ggml_vk_drain_memcpys(std::vector<vk_staging_memcpy> & memcpys) {
++    static int nthreads = -1;
++    if (nthreads < 0) {
++        const char * e = getenv("LLAMA_VK_COPY_DRAIN_THREADS");
++        nthreads = e && e[0] ? atoi(e) : 8;
++        if (nthreads < 1) {
++            nthreads = 1;
++        }
++        if (nthreads > 32) {
++            nthreads = 32;
++        }
++    }
++
++    auto drain_one = [](vk_staging_memcpy & cpy) {
++        if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
++            memcpy(cpy.dst, cpy.src, cpy.n);
++        }
++    };
++
++    const int n = (int) memcpys.size();
++    if (n <= 1 || nthreads <= 1) {
++        for (auto & cpy : memcpys) {
++            drain_one(cpy);
++        }
++        return;
++    }
++
++    const int nt = n < nthreads ? n : nthreads;
++    std::vector<std::thread> workers;
++    workers.reserve(nt - 1);
++    for (int t = 1; t < nt; ++t) {
++        workers.emplace_back([&memcpys, drain_one, t, nt]() {
++            for (int i = t; i < (int) memcpys.size(); i += nt) {
++                drain_one(memcpys[i]);
++            }
++        });
++    }
++    for (int i = 0; i < (int) memcpys.size(); i += nt) {
++        drain_one(memcpys[i]);
++    }
++    for (auto & w : workers) {
++        w.join();
++    }
++}
++
+ // Submit any pending transfer queue work and signal the transfer semaphore.
+ // The next compute context created via ggml_vk_get_compute_ctx will wait on this semaphore.
+ // Returns true if work was submitted.
+@@ -8650,11 +8770,14 @@ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx, vk::Fence
+     // the source is not a resolvable file mapping.
+     const bool sync_log = ggml_vk_copy_sync_enabled();
+     const int64_t drain_t0 = sync_log ? ggml_vk_now_us() : 0;
+-    for (auto& cpy : cpy_ctx->in_memcpys) {
+-        if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++    {
++        long bytes = 0;
++        for (auto & cpy : cpy_ctx->in_memcpys) {
++            bytes += (long) cpy.n;
+         }
++        g_copy_pool_bytes += bytes;
+     }
++    ggml_vk_drain_memcpys(cpy_ctx->in_memcpys);
+     if (sync_log) {
+         g_vk_copy_sync.drain_us += ggml_vk_now_us() - drain_t0;
+     }
+@@ -17054,7 +17177,20 @@ static bool ggml_vk_pread_parallel(const void * src, void * dst, size_t size) {
+         const char * e = getenv("LLAMA_VK_COPY_PREAD_DEPTH");
+         configured = e && e[0] ? atol(e) : 8;
+     }
+-    if (configured <= 1 || size < (4ull << 20)) {
++    // Size floor for engaging concurrent preads. Historically 4 MiB, chosen when
++    // the stream was drained one copy at a time and thread setup had to pay for
++    // itself. Now a whole batch of up to copy_batch_max independent copies is
++    // drained concurrently (ggml_vk_drain_memcpys), so the per-call cost is
++    // amortised across copies and the floor can drop to catch the 3.4 MB
++    // average that was falling back to a plain memcpy. Measured 10-02: 4 MiB
++    // -> 177.5/193.7 t/s, 256 KiB -> 202.2/201.3 t/s, order-controlled.
++    // LLAMA_VK_COPY_PREAD_MIN_KB.
++    static long min_bytes = -1;
++    if (min_bytes < 0) {
++        const char * e = getenv("LLAMA_VK_COPY_PREAD_MIN_KB");
++        min_bytes = e && e[0] ? atol(e) * 1024 : (256ll << 10);
++    }
++    if (configured <= 1 || (long long) size < min_bytes) {
+         return false;
+     }
+     g_vk_pread_calls++;
+@@ -17594,7 +17730,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
+             // reads a staged tensor — one submit and one fence for many
+             // copyBuffers, instead of one round trip per copy.
+             if (ctx->copy_batch.size() >= ctx->copy_batch_max) {
+-                ggml_vk_copy_pool_flush(ctx);
++                ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_BATCH_FULL);
+             }
+             return;
+         }
+@@ -17760,7 +17896,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     bool do_transfer = !ctx->compute_ctx.expired();
+ 
+     // Push any staged-but-unsubmitted copy batch before anything can read it.
+-    ggml_vk_copy_pool_flush(ctx);
++    ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_SYNCHRONIZE);
+     if (ggml_vk_submit_transfer_ctx(ctx)) {
+         ctx->submit_pending = true;
+     }
+@@ -18512,7 +18648,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     bool first_node_in_batch = true; // true if next node will be first node in a batch
+     int submit_node_idx = 0; // index to first node in a batch
+ 
+-    ggml_vk_copy_pool_flush(ctx);
++    ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_GRAPH_COMPUTE);
+     ggml_vk_submit_transfer_ctx(ctx);
+ 
+     vk_context compute_ctx;
+@@ -19243,7 +19379,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+     vk_event *vkev = (vk_event *)event->context;
+ 
+-    ggml_vk_copy_pool_flush(ctx);
++    ggml_vk_copy_pool_flush(ctx, GGML_VK_FLUSH_EVENT_RECORD);
+     ggml_vk_submit_transfer_ctx(ctx);
+ 
+     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+-- 
+2.55.0

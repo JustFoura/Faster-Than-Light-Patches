@@ -1,0 +1,133 @@
+From e5b93b6b0c1affe748dcbe425de0239000924cfc Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 17:13:02 +1300
+Subject: [PATCH 05/18] llama-context: LLAMA_MOE_PREFETCH=1 sequential expert
+ page-cache prefetch for prompt passes
+
+Any prompt >= ~470 tokens touches essentially all 512 experts per layer, so
+the expert range streams off the SSD once regardless of which backend
+computes it. Both consumers measured far under the 1.6 GB/s disk ceiling:
+the Vulkan host-mapping fault path at 0.88 GB/s effective (ubatch 8704
+one-pass, 88 t/s), the CPU mul_mat_id kernel at 0.51 (compute-limited at
+wide ubatch) but 1.41 at narrow. MADV_WILLNEED from a detached thread per
+prompt batch keeps the page-cache window ahead of the consumption so disk
+reads stay sequential and deep. 64 MB chunks over the ffn_*_exps ranges;
+opt-in env, in-flight guard, first fire at n_tokens >= 470.
+---
+ src/llama-context.cpp | 69 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.h   |  2 ++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b538b51b3..c1aae80fc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -15,9 +15,15 @@
+ #include "llama-sampler.h"
+ #include "llama.h"
+ 
++#include <atomic>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
++#include <mutex>
++#include <thread>
++
++#include <sys/mman.h>
++#include <unistd.h>
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
+@@ -1645,6 +1651,67 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+ 
++// Sequential expert-weight page-cache prefetch for prompt passes. On this
++// model (512 experts, top-10) any prompt of >= ~470 tokens touches essentially
++// every expert, so the whole expert range streams off the SSD once no matter
++// which backend computes it. The Vulkan host-mapping fault path consumes those
++// pages at low queue depth (measured 0.8-1.1 GB/s effective); MADV_WILLNEED
++// from a side thread keeps the page-cache window ahead of the faults so the
++// disk reads stay sequential and deep. Opt-in via LLAMA_MOE_PREFETCH=1; the
++// in-flight guard collapses overlapping prompt batches into one pass.
++void llama_context::moe_prefetch_kick(int64_t n_tokens) {
++    static const int env_on = [] {
++        const char * e = getenv("LLAMA_MOE_PREFETCH");
++        return e && e[0] == '1';
++    }();
++    if (!env_on || n_tokens < 470) {
++        return;
++    }
++
++    static std::atomic<bool> in_flight(false);
++    bool expected = false;
++    if (!in_flight.compare_exchange_strong(expected, true)) {
++        return;
++    }
++
++    static std::vector<std::pair<void *, size_t>> * ranges = nullptr;
++    static std::once_flag once;
++    std::call_once(once, [this]() {
++        auto * r = new std::vector<std::pair<void *, size_t>>();
++        size_t total = 0;
++        for (const auto & tn : model.tensors_by_name) {
++            const char * name = tn.first.c_str();
++            if (strstr(name, "ffn_up_exps") || strstr(name, "ffn_gate_exps") ||
++                    strstr(name, "ffn_down_exps")) {
++                const size_t nbytes = ggml_nbytes(tn.second);
++                r->emplace_back(tn.second->data, nbytes);
++                total += nbytes;
++            }
++        }
++        LLAMA_LOG_INFO("%s: %zu expert tensors, %.1f GiB, LLAMA_MOE_PREFETCH=1\n",
++                __func__, r->size(), total / (1024.0 * 1024.0 * 1024.0));
++        ranges = r;
++    });
++
++    if (!ranges || ranges->empty()) {
++        in_flight = false;
++        return;
++    }
++
++    std::thread([ranges]() {
++        const long   pg    = sysconf(_SC_PAGESIZE);
++        const size_t chunk = 64UL << 20;
++        for (const auto & r : *ranges) {
++            const uintptr_t base = (uintptr_t) r.first & ~((uintptr_t) pg - 1);
++            const size_t    len  = r.second + ((uintptr_t) r.first - base);
++            for (size_t off = 0; off < len; off += chunk) {
++                madvise((void *) (base + off), std::min(chunk, len - off), MADV_WILLNEED);
++            }
++        }
++        in_flight = false;
++    }).detach();
++}
++
+ int llama_context::decode(const llama_batch & batch_inp) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+@@ -1660,6 +1727,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         return -1;
+     }
+ 
++    moe_prefetch_kick(batch_inp.n_tokens);
++
+     const auto & vocab   = model.vocab;
+     const auto & hparams = model.hparams;
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..144a56880 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -143,6 +143,8 @@ struct llama_context {
+     int encode(const llama_batch & batch_inp);
+     int decode(const llama_batch & batch_inp);
+ 
++    void moe_prefetch_kick(int64_t n_tokens);
++
+     //
+     // state save/load
+     //
+-- 
+2.55.0
+

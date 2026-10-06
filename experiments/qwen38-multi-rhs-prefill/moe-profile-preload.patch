@@ -1,0 +1,131 @@
+--- a/src/llama-moecache.cpp	2026-09-25 20:52:48.059411392 +1200
++++ b/src/llama-moecache.cpp	2026-09-27 21:35:50.122162780 +1300
+@@ -6,6 +6,7 @@
+ #include "ggml.h"
+ #include "ggml-backend.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <condition_variable>
+ #include <cstdlib>
+@@ -164,6 +165,108 @@
+     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+ }
+ 
++// LLAMA_MOE_PROFILE: preload the per-layer hottest experts from a GGML_MOE_LOG
++// route dump so decode starts with a hot cache instead of learning the working
++// set by LRU. The dump has one line per routed node:
++//   blk.<il>.ffn_gate_exps.weight <id> <id> ...
++// Experts are ranked by route count per layer; the top n_slots fill the device
++// slots (most frequent keeps the highest LRU clock, so it is evicted last and
++// runtime adaptation still works); the next n_ram (when the RAM tier is on)
++// mirror into the host-RAM level for fast future inserts.
++void preload_from_profile(moe_cache * mc) {
++    const char * path = getenv("LLAMA_MOE_PROFILE");
++    if (!path || !path[0]) {
++        return;
++    }
++    FILE * f = fopen(path, "r");
++    if (!f) {
++        LLAMA_LOG_WARN("%s: LLAMA_MOE_PROFILE '%s' not found - starting cold\n", __func__, path);
++        return;
++    }
++
++    std::map<int, std::map<int32_t, uint64_t>> counts;
++    char line[8192];
++    uint64_t n_lines = 0;
++    while (fgets(line, sizeof(line), f)) {
++        if (!strstr(line, "ffn_gate_exps")) {
++            continue;
++        }
++        const int il = parse_layer_from_name(line);
++        if (il < 0) {
++            continue;
++        }
++        char * sp = strchr(line, ' ');
++        if (!sp) {
++            continue;
++        }
++        char * end = NULL;
++        for (long v = strtol(sp, &end, 10); end != sp; v = strtol(sp, &end, 10)) {
++            sp = end;
++            if (v >= 0 && v < 65536) {
++                counts[il][(int32_t) v]++;
++            }
++        }
++        ++n_lines;
++    }
++    fclose(f);
++
++    size_t n_preloaded = 0;
++    size_t n_preloaded_ram = 0;
++    for (auto & ls : mc->layers) {
++        auto it = counts.find(ls.pub.il);
++        if (it == counts.end() || it->second.empty()) {
++            continue;
++        }
++        std::vector<std::pair<uint64_t, int32_t>> ranked;
++        ranked.reserve(it->second.size());
++        for (const auto & kv : it->second) {
++            ranked.push_back({kv.second, kv.first});
++        }
++        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
++
++        // device slots: most frequent first; clocks are bumped in REVERSE so
++        // the hottest expert ends up with the highest LRU clock (evicted last)
++        // while runtime adaptation still owns everything below the profile cut
++        const int32_t n_dev = (int32_t) std::min<size_t>(ranked.size(), (size_t) mc->n_slots);
++        for (int32_t s = n_dev - 1; s >= 0; --s) {
++            const int32_t e = ranked[s].second;
++            ls.slot_expert[s]   = e;
++            ls.expert_slot[e]   = s;
++            ls.slot_last_use[s] = ++mc->clock;
++            upload_slice(ls.pub.gate_c, ls.pub.gate_src, e, s);
++            upload_slice(ls.pub.up_c,   ls.pub.up_src,   e, s);
++            upload_slice(ls.pub.down_c, ls.pub.down_src, e, s);
++            set_table_entry(ls.pub, e, s);
++        }
++        n_preloaded += n_dev;
++
++        // RAM mirror: the next n_ram experts, staged so a later miss can be
++        // uploaded from RAM instead of re-reading the mmap
++        if (ls.n_ram > 0) {
++            const size_t sz_up   = (size_t) ls.pub.up_src->nb[2];
++            const size_t sz_gate = (size_t) ls.pub.gate_src->nb[2];
++            const size_t sz_down = (size_t) ls.pub.down_src->nb[2];
++            const int32_t n_ram_pre = (int32_t) std::min<size_t>(ranked.size() - n_dev, (size_t) ls.n_ram);
++            for (int32_t r = 0; r < n_ram_pre; ++r) {
++                const int32_t e = ranked[n_dev + r].second;
++                memcpy(ls.up_ram.data()   + (size_t) r*sz_up,
++                        (const char *) ls.pub.up_src->data   + (size_t) e*sz_up,   sz_up);
++                memcpy(ls.gate_ram.data() + (size_t) r*sz_gate,
++                        (const char *) ls.pub.gate_src->data + (size_t) e*sz_gate, sz_gate);
++                memcpy(ls.down_ram.data() + (size_t) r*sz_down,
++                        (const char *) ls.pub.down_src->data + (size_t) e*sz_down, sz_down);
++                ls.ram_slot_expert[r]  = e;
++                ls.ram_expert_slot[e]  = r;
++                ls.ram_last_use[r]     = ++mc->clock;
++            }
++            n_preloaded_ram += n_ram_pre;
++        }
++    }
++
++    LLAMA_LOG_INFO("%s: %s: %llu route lines -> %zu device slots + %zu RAM slots preloaded across %zu layers\n",
++            __func__, path, (unsigned long long) n_lines, n_preloaded, n_preloaded_ram, mc->layers.size());
++}
++
+ } // namespace
+ 
+ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+@@ -346,6 +449,11 @@
+             }
+         }
+ 
++        // route-profile preload runs after the tiers exist (it fills both) and
++        // before the upload worker / observer start, so the synchronous slice
++        // copies at init cannot race a running graph
++        preload_from_profile(mc);
++
+         mc->worker = std::thread([mc]() {
+             for (;;) {
+                 upload_job j;

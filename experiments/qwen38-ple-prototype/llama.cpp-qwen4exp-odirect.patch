@@ -1,0 +1,180 @@
+diff --git i/src/llama-lazy-reader.h w/src/llama-lazy-reader.h
+index 4b97487c8..fe4a0f755 100644
+--- i/src/llama-lazy-reader.h
++++ w/src/llama-lazy-reader.h
+@@ -11,0 +12,2 @@
++#include <cstdint>
++#include <cstdlib>
+@@ -13,0 +16 @@
++#include <memory>
+@@ -35 +38 @@ struct llama_lazy_reader {
+-                      enum ggml_type type, int64_t head_dim)
++                      enum ggml_type type, int64_t head_dim, bool direct_io)
+@@ -37 +40,2 @@ struct llama_lazy_reader {
+-          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
++          head_dim(head_dim), direct_io(direct_io),
++          to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
+@@ -56,0 +61 @@ struct llama_lazy_reader {
++    const bool     direct_io;  // O_DIRECT; reads are grouped into aligned filesystem pages
+@@ -71,0 +77,5 @@ struct llama_lazy_reader {
++        if (direct_io) {
++            gather_direct_pages(pairs, dst);
++            return;
++        }
++
+@@ -113,0 +124,123 @@ private:
++    void gather_direct_pages(const std::vector<std::pair<int32_t, int32_t>> & pairs, float * dst) const {
++        const long page_size_long = ::sysconf(_SC_PAGESIZE);
++        if (page_size_long <= 0) {
++            throw std::runtime_error("could not determine system page size for O_DIRECT PLE reads");
++        }
++        const size_t page_size = (size_t) page_size_long;
++
++        std::vector<size_t> page_offsets;
++        page_offsets.reserve(pairs.size() * 2);
++        for (const auto & pair : pairs) {
++            const size_t off = base + (size_t) pair.first * row_size;
++            const size_t first = off / page_size * page_size;
++            const size_t last  = (off + row_size - 1) / page_size * page_size;
++            page_offsets.push_back(first);
++            if (last != first) {
++                page_offsets.push_back(last);
++            }
++        }
++        std::sort(page_offsets.begin(), page_offsets.end());
++        page_offsets.erase(std::unique(page_offsets.begin(), page_offsets.end()), page_offsets.end());
++
++        if (page_offsets.size() > SIZE_MAX / page_size) {
++            throw std::runtime_error("O_DIRECT PLE page buffer size overflow");
++        }
++        const size_t buffer_size = page_offsets.size() * page_size;
++        void * raw_pages = nullptr;
++        const int alloc_rc = ::posix_memalign(&raw_pages, page_size, buffer_size);
++        if (alloc_rc != 0) {
++            throw std::runtime_error(format("could not allocate %zu aligned PLE read bytes: %s",
++                    buffer_size, strerror(alloc_rc)));
++        }
++        std::unique_ptr<uint8_t, decltype(&std::free)> pages((uint8_t *) raw_pages, &std::free);
++
++        const int n_workers = (int) std::min<size_t>(n_threads, std::max<size_t>(1, page_offsets.size() / 32));
++        auto run_chunk = [&](int w, std::exception_ptr & err) {
++            try {
++                const int64_t begin = (int64_t) page_offsets.size() * w / n_workers;
++                const int64_t end   = (int64_t) page_offsets.size() * (w + 1) / n_workers;
++                for (int64_t i = begin; i < end; ++i) {
++                    size_t done = 0;
++                    const size_t off = page_offsets[i];
++                    while (done < page_size) {
++                        const ssize_t n_read = ::pread(fd, pages.get() + (size_t) i * page_size + done,
++                                page_size - done, off + done);
++                        if (n_read < 0 && errno == EINTR) {
++                            continue;
++                        }
++                        // O_DIRECT requires aligned offsets, lengths, and buffers. A short
++                        // page read cannot be resumed at an unaligned address safely.
++                        if (n_read <= 0 || (size_t) n_read != page_size - done) {
++                            throw std::runtime_error(format("O_DIRECT PLE page read at %zu returned %zd bytes: %s",
++                                    off, n_read, n_read == 0 ? "unexpected EOF" : strerror(errno)));
++                        }
++                        done += (size_t) n_read;
++                    }
++                }
++            } catch (...) {
++                err = std::current_exception();
++            }
++        };
++
++        std::vector<std::exception_ptr> errs(n_workers);
++        std::vector<std::thread> workers;
++        try {
++            for (int w = 1; w < n_workers; ++w) {
++                workers.emplace_back([&run_chunk, &errs, w]() {
++                    run_chunk(w, errs[w]);
++                });
++            }
++        } catch (...) {
++            for (auto & t : workers) {
++                t.join();
++            }
++            throw;
++        }
++        run_chunk(0, errs[0]);
++        for (auto & t : workers) {
++            t.join();
++        }
++        for (const auto & err : errs) {
++            if (err) {
++                std::rethrow_exception(err);
++            }
++        }
++
++        std::vector<uint8_t> bounce(row_size);
++        size_t page_index = 0;
++        for (int64_t i = 0; i < (int64_t) pairs.size(); ) {
++            int64_t j = i;
++            while (j + 1 < (int64_t) pairs.size() && pairs[j + 1].first == pairs[i].first) {
++                ++j;
++            }
++            const size_t off = base + (size_t) pairs[i].first * row_size;
++            const size_t page_off = off / page_size * page_size;
++            while (page_index + 1 < page_offsets.size() && page_offsets[page_index] < page_off) {
++                ++page_index;
++            }
++            GGML_ASSERT(page_offsets[page_index] == page_off);
++            const size_t in_page = off - page_off;
++            const size_t first_n = std::min(row_size, page_size - in_page);
++            const uint8_t * row = pages.get() + page_index * page_size + in_page;
++            if (first_n != row_size) {
++                memcpy(bounce.data(), row, first_n);
++                GGML_ASSERT(page_index + 1 < page_offsets.size() && page_offsets[page_index + 1] == page_off + page_size);
++                memcpy(bounce.data() + first_n, pages.get() + (page_index + 1) * page_size, row_size - first_n);
++                row = bounce.data();
++            }
++            float * first = dst + (size_t) pairs[i].second * head_dim;
++            if (to_float) {
++                to_float(row, first, head_dim);
++            } else {
++                memcpy(first, row, (size_t) head_dim * sizeof(float));
++            }
++            for (int64_t k = i + 1; k <= j; ++k) {
++                memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
++            }
++            i = j + 1;
++        }
++
++        LLAMA_LOG_INFO("%s: O_DIRECT PLE gather: %zu requested rows, %zu aligned pages (%zu bytes)\n",
++                __func__, pairs.size(), page_offsets.size(), buffer_size);
++    }
++
+diff --git i/src/llama-model.cpp w/src/llama-model.cpp
+index 48edbd2df..c013e63c3 100644
+--- i/src/llama-model.cpp
++++ w/src/llama-model.cpp
+@@ -1980,4 +1980,14 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader
+-    // an independently opened buffered descriptor: dup() would share the
+-    // loader's open file description, whose readahead advice and O_DIRECT
+-    // flag would fight the small scattered row reads
+-    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
++    // Use a separate descriptor so the page-random PLE reads do not change
++    // the loader's I/O hints. On Linux, try O_DIRECT first; the page reader
++    // batches row requests into aligned reads. Keep the buffered fallback for
++    // filesystems that do not support direct reads.
++    const char * file_name = ml.files[w->idx]->name().c_str();
++    int fd = -1;
++    bool direct_io = false;
++#ifdef O_DIRECT
++    fd = ::open(file_name, O_RDONLY | O_CLOEXEC | O_DIRECT);
++    direct_io = fd >= 0;
++#endif
++    if (fd < 0) {
++        fd = ::open(file_name, O_RDONLY | O_CLOEXEC);
++    }
+@@ -2002 +2012 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader
+-            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
++            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0], direct_io);
+@@ -2004,2 +2014,3 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader
+-    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
+-            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
++    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads, %s\n",
++            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads,
++            direct_io ? "page-batched O_DIRECT" : "buffered pread");

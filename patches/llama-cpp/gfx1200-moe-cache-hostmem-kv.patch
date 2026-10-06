@@ -1,0 +1,183 @@
+diff --git i/ggml/include/ggml-vulkan.h w/ggml/include/ggml-vulkan.h
+index ed5ea5f79..26a66ae38 100644
+--- i/ggml/include/ggml-vulkan.h
++++ w/ggml/include/ggml-vulkan.h
+@@ -19,6 +19,9 @@ GGML_BACKEND_API void ggml_backend_vk_get_device_description(int device, char *
+ GGML_BACKEND_API void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
+ 
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
++// system RAM (GTT) the GPU addresses directly; buffers are never device-local,
++// so allocation fails instead of consuming VRAM
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_hostmem_buffer_type(size_t dev_num);
+ // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
+ 
+diff --git i/ggml/src/ggml-vulkan/ggml-vulkan.cpp w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 72e844aeb..67959a06b 100644
+--- i/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -381,6 +381,23 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
+     /* .is_host          = */ NULL,
+ };
+ 
++// hostmem buffer type: system RAM (GTT) the GPU addresses directly, never
++// device-local memory; used for KV caches that must stay in host memory
++// without forcing attention onto the CPU. The name getter is shared with the
++// regular vk buffer type on purpose: ggml_backend_buffer_is_vk() compares the
++// function pointer, and the compute path must treat hostmem buffers as vk
++// buffers.
++static ggml_backend_buffer_t ggml_backend_vk_hostmem_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
++
++static ggml_backend_buffer_type_i ggml_backend_vk_hostmem_buffer_type_interface = {
++    /* .get_name         = */ ggml_backend_vk_buffer_type_name,
++    /* .alloc_buffer     = */ ggml_backend_vk_hostmem_buffer_type_alloc_buffer,
++    /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
++    /* .get_max_size     = */ ggml_backend_vk_buffer_type_get_max_size,
++    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
++    /* .is_host          = */ NULL,
++};
++
+ class vk_memory_logger;
+ class vk_perf_logger;
+ static void ggml_vk_destroy_buffer(vk_buffer& buf);
+@@ -1120,6 +1137,7 @@ struct vk_device_struct {
+     vk_buffer sync_staging;
+ 
+     ggml_backend_buffer_type buffer_type;
++    ggml_backend_buffer_type hostmem_buffer_type; // system RAM the GPU addresses directly (never device-local)
+ 
+     bool disable_fusion;
+     bool disable_host_visible_vidmem;
+@@ -3432,13 +3450,14 @@ static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
+     }
+ }
+ 
+-static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
++static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags, vk::MemoryPropertyFlags exclude_flags = {}) {
+     std::vector<uint32_t> indices;
+ 
+     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
+         vk::MemoryType memory_type = mem_props->memoryTypes[i];
+         if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
+             (flags & memory_type.propertyFlags) == flags &&
++            (exclude_flags == vk::MemoryPropertyFlags(0) || !(memory_type.propertyFlags & exclude_flags)) &&
+             mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
+             indices.push_back(i);
+         }
+@@ -3447,7 +3466,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
+ }
+ 
+ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
+-                                       void *import_ptr = nullptr) {
++                                       void *import_ptr = nullptr, vk::MemoryPropertyFlags exclude_flags = vk::MemoryPropertyFlags(0)) {
+     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
+     if (size > device->max_buffer_size) {
+         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+@@ -3543,7 +3562,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
+         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
+             const auto & req_flags = *it;
+ 
+-            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
++            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, exclude_flags);
+ 
+             if (memory_type_indices.empty()) {
+                 continue;
+@@ -7130,6 +7149,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+         };
+ 
++        device->hostmem_buffer_type = {
++            /* .iface    = */ ggml_backend_vk_hostmem_buffer_type_interface,
++            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
++            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "-HOSTMEM", device },
++        };
++
+         device->fence = device->device.createFence({});
+ 
+         device->idx = idx;
+@@ -16407,6 +16432,44 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
+     return &dev->buffer_type;
+ }
+ 
++// hostmem (GTT) buffer type
++
++static vk_buffer ggml_vk_create_buffer_hostmem(vk_device& device, size_t size) {
++    // host-visible system RAM (GTT) the GPU reads and writes directly. Must NOT
++    // be device-local: falling back to BAR would silently consume VRAM, so
++    // device-local is excluded and allocation fails hard instead.
++    return ggml_vk_create_buffer(device, size,
++        { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent },
++        nullptr,
++        vk::MemoryPropertyFlagBits::eDeviceLocal);
++}
++
++static ggml_backend_buffer_t ggml_backend_vk_hostmem_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    VK_LOG_MEMORY("ggml_backend_vk_hostmem_buffer_type_alloc_buffer(" << size << ")");
++    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
++
++    vk_buffer dev_buffer = nullptr;
++    try {
++        dev_buffer = ggml_vk_create_buffer_hostmem(ctx->device, size);
++    } catch (const vk::SystemError& e) {
++        return nullptr;
++    }
++
++    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
++
++    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++}
++
++ggml_backend_buffer_type_t ggml_backend_vk_hostmem_buffer_type(size_t dev_num) {
++    ggml_vk_instance_init();
++
++    VK_LOG_DEBUG("ggml_backend_vk_hostmem_buffer_type(" << dev_num << ")");
++
++    vk_device dev = ggml_vk_get_device(dev_num);
++
++    return &dev->hostmem_buffer_type;
++}
++
+ // host buffer type
+ 
+ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+diff --git i/src/llama-kv-cache.cpp w/src/llama-kv-cache.cpp
+index 8fafcd153..8219ff3da 100644
+--- i/src/llama-kv-cache.cpp
++++ w/src/llama-kv-cache.cpp
+@@ -15,6 +15,8 @@
+ #include <stdexcept>
+ #include <unordered_map>
+ 
++#include "ggml-vulkan.h"
++
+ static bool ggml_is_power_of_2(int n) {
+     return (n & (n - 1)) == 0;
+ }
+@@ -216,9 +218,24 @@ llama_kv_cache::llama_kv_cache(
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+-
+-            dev_name = ggml_backend_dev_name(dev);
++            // Keep the cache in Vulkan GTT system memory while leaving attention
++            // on the GPU. GTT is explicitly selected to avoid consuming VRAM.
++            static const bool kv_hostmem = getenv("LLAMA_KV_HOSTMEM") != nullptr;
++            if (kv_hostmem && strncmp(ggml_backend_dev_name(dev), "Vulkan", 6) == 0) {
++                ggml_backend_reg_t vk_reg = ggml_backend_vk_reg();
++                size_t vk_idx = 0;
++                for (size_t i = 0; i < ggml_backend_reg_dev_count(vk_reg); i++) {
++                    if (ggml_backend_reg_dev_get(vk_reg, i) == dev) {
++                        vk_idx = i;
++                        break;
++                    }
++                }
++                buft = ggml_backend_vk_hostmem_buffer_type(vk_idx);
++                dev_name = "Vulkan-HOSTMEM";
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++                dev_name = ggml_backend_dev_name(dev);
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

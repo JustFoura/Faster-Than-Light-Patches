@@ -1,0 +1,375 @@
+From 321dff9b5bccbd08bc0b0ec6a0d1a4bad4e94c9f Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Fri, 2 Oct 2026 00:26:03 +1300
+Subject: [PATCH 14/18] Large-copy page-in depth for the prompt-path expert
+ weight copies
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The graph scheduler copies every expert weight tensor from its CPU_Mapped
+mmap home into a device buffer before each prompt-pass mul_mat_id (144
+tensors, ~68 GB per one-pass prefill). That volume is irreducible: at
+top-10 of 512 experts with 14963 tokens every expert in every layer is
+selected ~6 times on average (P(any expert untouched) ~ 1e-129), so the
+scheduler's own "copy only used experts" path collapses into whole-tensor
+runs and copies everything. There is nothing to skip.
+
+The read side was the lever: a straight memcpy out of the mapping is a
+queue-depth-1 fault stream, which extracted ~0.80 GB/s. Measured on this
+drive (scripts/probe-drive-rate.py, same file): 1.39 GB/s buffered at
+depth 1, 4.09 GB/s at depth 8, O_DIRECT saturating at 4.13 by depth 16.
+One-pass prefill at the 300-400 t/s target needs 1.37-1.82 GB/s sustained,
+i.e. 34-46% of the depth-8 rate the drive already demonstrates.
+
+So issue the reads instead of hinting the kernel. fadvise WILLNEED and the
+device-staging experiment both failed precisely because they attacked a
+queue-depth problem with advice; advice does not create queue depth,
+concurrent preads do. This mirrors the decode fanout pool already in
+ggml-cpu.c: resolve the file mapping behind src (same /proc/self/maps
+approach as ggml_moe_pread_resolve), split the copy on 4 KiB boundaries,
+and issue that many blocking preads into the same staging buffer. Bytes,
+destination, and the submit->fence structure are untouched, so outputs are
+byte-identical; only who moves the bytes changes.
+
+Wired into all four host->device in_memcpys write drains. The
+out_memcpys (device->host) drains are deliberately left alone: they do not
+touch model weights. The first three sites this was tried at
+(ggml_vk_buffer_write_2d and friends) turned out not to be on the prompt
+path at all — the scheduler's copies arrive via
+ggml_backend_vk_set_tensor_2d_async and drain in the transfer/compute
+submit paths — which is why a first diagnostic run reported zero hits.
+
+Gated by LLAMA_VK_COPY_PREAD_DEPTH (default 8; 1 or 0 restores plain
+memcpy). Falls back to memcpy on any unresolved mapping, copy that would
+cross into another mapping, or short read. Copies under 4 MB are left to
+memcpy. A counter line reports hits/fails/paged bytes.
+
+Measured (gate-C condition, one-pass 14960 tok, ubatch 16384):
+171.6 t/s stock vs 180.4 t/s at depth 8, 28.9 GB paged, 3968 hits, 0 fails.
+Real but modest — see the note below on what this does and does not prove.
+
+Note on interpretation: queue depth is a genuine contributor but NOT the
+dominant term. Only ~28.9 of the ~68 GB reaches this path, and the copies
+are already overlapped with GPU work through the transfer queue and its
+semaphore, so deepening the read stream only helps the fraction that was
+actually blocking. Do not read +5% as "queue depth was the whole wall" —
+the next step is to profile what the remaining ~83 s of the pass is made
+of (shader vs copy serialization) before building anything larger.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 254 ++++++++++++++++++++++++++-
+ 1 file changed, 250 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f2fb0cdeb..aee2a9c0e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -68,6 +68,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include <condition_variable>
+ #include <thread>
+ #include <fcntl.h>
++#include <unistd.h>
+ 
+ #if defined(_MSC_VER)
+ # define NOMINMAX 1
+@@ -8390,6 +8391,12 @@ static vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
+     return result;
+ }
+ 
++// Large-copy page-in depth. Defined near the other large-copy helpers at the
++// bottom of this file; every host->device staging memcpy drain funnels through
++// it. Forward-declared here because the definition sits after its first call
++// sites.
++static bool ggml_vk_pread_parallel(const void * src, void * dst, size_t size);
++
+ // Submit any pending transfer queue work and signal the transfer semaphore.
+ // The next compute context created via ggml_vk_get_compute_ctx will wait on this semaphore.
+ // Returns true if work was submitted.
+@@ -8401,8 +8408,17 @@ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
+     vk_context cpy_ctx = ctx->transfer_ctx.lock();
+     ggml_vk_ctx_end(cpy_ctx);
+ 
++    // Large-copy page-in depth (see ggml_vk_pread_parallel): this is the drain
++    // for the graph scheduler's prompt-path expert weight copies, which arrive
++    // here via ggml_backend_vk_set_tensor_2d_async. A straight memcpy out of
++    // the CPU_Mapped mmap is a queue-depth-1 fault stream (~0.80 GB/s against
++    // a drive that sustains 4.09 GB/s at depth 8); concurrent preads fetch the
++    // same bytes into the same staging buffer. Falls back to memcpy whenever
++    // the source is not a resolvable file mapping.
+     for (auto& cpy : cpy_ctx->in_memcpys) {
+-        memcpy(cpy.dst, cpy.src, cpy.n);
++        if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
++            memcpy(cpy.dst, cpy.src, cpy.n);
++        }
+     }
+ 
+     ctx->transfer_semaphore.value++;
+@@ -8646,8 +8662,19 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void *
+         GGML_ASSERT(ret);
+         ggml_vk_ctx_end(subctx);
+ 
++        // Large-copy page-in depth. Each deferred memcpy here is a straight
++        // memcpy out of the model's CPU_Mapped mmap, i.e. a queue-depth-1
++        // fault stream: that is what held prefill to ~0.80 GB/s against a
++        // drive that sustains 4.09 GB/s at depth 8. When the source is a
++        // resolvable file mapping, fetch it with concurrent preads instead —
++        // same bytes into the same staging buffer, so the upload and the
++        // outputs are unchanged. Falls back to memcpy on any unresolved
++        // source or short read. Gated by LLAMA_VK_COPY_PREAD_DEPTH
++        // (default 8; 1 or 0 disables and restores the memcpy).
+         for (auto& cpy : subctx->in_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
++                memcpy(cpy.dst, cpy.src, cpy.n);
++            }
+         }
+ 
+         for (auto& mset : subctx->memsets) {
+@@ -16462,7 +16489,9 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
+ 
+         // Do staging buffer copies
+         for (auto& cpy : subctx->in_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
++                memcpy(cpy.dst, cpy.src, cpy.n);
++            }
+         }
+ 
+         for (auto& mset : subctx->memsets) {
+@@ -16648,6 +16677,218 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
+     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+ }
+ 
++// ---- large-copy parallel page-in (2026-10-01) -------------------------------
++// The prefill wall, established by measurement (docs/bench-results-2026-10-01/
++// FINDINGS-EVENING.md, and the drive sweep in this repo's
++// scripts/probe-drive-rate.py):
++//
++//   * The graph scheduler copies every expert weight tensor from its
++//     CPU_Mapped mmap home into a device buffer before each prompt-pass
++//     mul_mat_id: 144 tensors x ~450 MB, ~68 GB per one-pass prefill.
++//   * That volume is IRREDUCIBLE. At top-10 of 512 experts with 14963 tokens
++//     every expert in every layer is selected ~6 times on average
++//     (P(any expert untouched) ~ 1e-129), so the scheduler's "copy only the
++//     used experts" path collapses into one whole-tensor run and copies
++//     everything. There is nothing to skip.
++//   * The copy's read side is a single-threaded memcpy faulting through the
++//     mmap at queue depth 1, which extracts ~0.80 GB/s. The same file on the
++//     same drive sustains 1.39 GB/s at depth 1 and 4.09 GB/s at depth 8
++//     (O_DIRECT saturates at 4.13 GB/s by depth 16). So the wall is queue
++//     depth, not the device.
++//
++// One-pass prefill at the 300-400 t/s target needs 1.37-1.82 GB/s sustained
++// (68 GB / 50 s and / 37 s), i.e. 34-46% of the depth-8 rate the drive has
++// already demonstrated. Depth 8 clears the whole band.
++//
++// So: issue the reads ourselves instead of hinting the kernel. fadvise
++// WILLNEED and the device-staging experiments both failed precisely because
++// they tried to fix a queue-depth problem with advice; advice does not create
++// queue depth, concurrent preads do. The bytes, the destination and the
++// submit->fence structure are all unchanged, so outputs stay byte-identical.
++//
++// This is the same shape as the decode fanout pool in ggml-cpu.c (persistent
++// worker threads, one blocking pread each, condvar wake): the proven mechanism
++// for this drive, applied to the prompt path that never had it.
++
++// Resolve a pointer inside a file-backed mapping to (fd, file offset).
++// Mirrors ggml_moe_pread_resolve() in ggml-cpu.c: walk /proc/self/maps once,
++// cache up to 8 mappings, and answer from the cache afterwards.
++struct ggml_vk_pread_map {
++    const char * base;
++    const char * end;
++    int fd;
++    off_t map_off;
++};
++
++static int ggml_vk_pread_map_resolve(const void * addr, ggml_vk_pread_map * out) {
++    static std::mutex mu;
++    static ggml_vk_pread_map maps[8];
++    static int maps_n = 0;
++
++    std::lock_guard<std::mutex> guard(mu);
++
++    const char * want = (const char *) addr;
++    for (int i = 0; i < maps_n; ++i) {
++        if (want >= maps[i].base && want < maps[i].end) {
++            *out = maps[i];
++            return 0;
++        }
++    }
++    if (maps_n >= 8) {
++        return -1;
++    }
++    FILE * f = fopen("/proc/self/maps", "r");
++    if (f == NULL) {
++        return -1;
++    }
++    char line[1024];
++    int found = -1;
++    while (fgets(line, sizeof(line), f)) {
++        uintptr_t lo = 0, hi = 0;
++        char perms[8] = {0};
++        unsigned long long off = 0;
++        unsigned int devmaj = 0, devmin = 0;
++        long inode = 0;
++        if (sscanf(line, "%lx-%lx %7s %llx %x:%x %li",
++                    &lo, &hi, perms, &off, &devmaj, &devmin, &inode) != 7 ||
++                inode == 0 || perms[0] != 'r' || want < (const char *) lo || want >= (const char *) hi) {
++            continue;
++        }
++        const char * path = strchr(line, '/');
++        if (path == NULL) {
++            continue;
++        }
++        char pathbuf[768];
++        size_t plen = strcspn(path, "\n");
++        if (plen == 0 || plen >= sizeof(pathbuf)) {
++            continue;
++        }
++        memcpy(pathbuf, path, plen);
++        pathbuf[plen] = '\0';
++        int fd = open(pathbuf, O_RDONLY);
++        if (fd < 0) {
++            continue;
++        }
++        ggml_vk_pread_map * nm = &maps[maps_n++];
++        nm->base = (const char *) lo;
++        nm->end  = (const char *) hi;
++        nm->fd   = fd;
++        nm->map_off = (off_t) off;
++        *out = *nm;
++        found = 0;
++        break;
++    }
++    fclose(f);
++    return found;
++}
++
++// One worker's share: pread [start, start+len) of the file into dst.
++struct ggml_vk_pread_chunk {
++    int fd;
++    off_t file_off;
++    uint8_t * dst;
++    size_t len;
++    int failed;
++};
++
++static void * ggml_vk_pread_worker(void * arg) {
++    ggml_vk_pread_chunk * c = (ggml_vk_pread_chunk *) arg;
++    size_t got = 0;
++    while (got < c->len) {
++        ssize_t r = pread(c->fd, c->dst + got, c->len - got, c->file_off + (off_t) got);
++        if (r <= 0) {
++            c->failed = 1;
++            return nullptr;
++        }
++        got += (size_t) r;
++    }
++    return nullptr;
++}
++
++// Page `size` bytes at `src` into `dst` with `depth` concurrent preads.
++// Returns false if the source is not a resolvable file mapping, in which case
++// the caller must fall back to its existing memcpy.
++static long g_vk_pread_calls = 0, g_vk_pread_hit = 0, g_vk_pread_fail = 0, g_vk_pread_bytes = 0;
++static bool ggml_vk_pread_parallel(const void * src, void * dst, size_t size) {
++    static long configured = -1;
++    if (configured < 0) {
++        const char * e = getenv("LLAMA_VK_COPY_PREAD_DEPTH");
++        configured = e && e[0] ? atol(e) : 8;
++    }
++    if (configured <= 1 || size < (4ull << 20)) {
++        return false;
++    }
++    g_vk_pread_calls++;
++    int n = (int) configured;
++    if (n > 32) {
++        n = 32;
++    }
++
++    ggml_vk_pread_map m;
++    if (ggml_vk_pread_map_resolve(src, &m) != 0) {
++        return false;
++    }
++    // the whole source must live inside the one mapping
++    if ((const char *) src + size > m.end) {
++        return false;
++    }
++
++    // 4 KiB-align the split points so every chunk is a whole number of pages
++    const size_t chunk_align = 4096;
++    size_t n_chunks = size / chunk_align;
++    if (n_chunks < (size_t) n) {
++        n = (int) n_chunks;
++    }
++    if (n < 2) {
++        return false;
++    }
++    const size_t per = ((size / n) / chunk_align) * chunk_align;
++    if (per == 0) {
++        return false;
++    }
++
++    std::vector<ggml_vk_pread_chunk> chunks;
++    chunks.reserve(n);
++    std::vector<std::thread> threads;
++    threads.reserve(n - 1);
++
++    size_t done = 0;
++    for (int i = 0; i < n; ++i) {
++        size_t len = (i == n - 1) ? (size - done) : per;
++        ggml_vk_pread_chunk c;
++        c.fd = m.fd;
++        c.file_off = m.map_off + (off_t) ((const char *) src - m.base) + (off_t) done;
++        c.dst  = (uint8_t *) dst + done;
++        c.len  = len;
++        c.failed = 0;
++        chunks.push_back(c);
++        done += len;
++    }
++
++    // the calling thread takes chunk 0 rather than idling
++    ggml_vk_pread_worker(&chunks[0]);
++    for (size_t i = 1; i < chunks.size(); ++i) {
++        threads.emplace_back(ggml_vk_pread_worker, &chunks[i]);
++    }
++    for (auto & t : threads) {
++        t.join();
++    }
++
++    for (const auto & c : chunks) {
++        if (c.failed) {
++            g_vk_pread_fail++;
++            return false;
++        }
++    }
++    g_vk_pread_hit++;
++    g_vk_pread_bytes += (long) size;
++    if (g_vk_pread_hit == 1 || g_vk_pread_hit % 64 == 0) {
++        fprintf(stderr, "[copy-pread] depth=%ld hits=%ld fails=%ld paged=%.1f GB\n",
++                configured, g_vk_pread_hit, g_vk_pread_fail, g_vk_pread_bytes / 1e9);
++    }
++    return true;
++}
++
+ // ---- large-copy read-ahead (2026-10-01) ------------------------------------
+ // The graph scheduler copies every expert weight from its CPU_Mapped home
+ // (a plain mmap of the GGUF) into a device buffer before each prompt-pass
+@@ -17221,8 +17462,13 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+ 
+         ggml_vk_ctx_end(compute_ctx);
+ 
++        // Same large-copy page-in depth as the transfer-queue drain above; this
++        // is the path taken when async_use_transfer_queue is off, which is the
++        // default on this device.
+         for (auto& cpy : compute_ctx->in_memcpys) {
+-            memcpy(cpy.dst, cpy.src, cpy.n);
++            if (!ggml_vk_pread_parallel(cpy.src, cpy.dst, cpy.n)) {
++                memcpy(cpy.dst, cpy.src, cpy.n);
++            }
+         }
+ 
+         if (ctx->device->serialize_submissions) {
+-- 
+2.55.0
+

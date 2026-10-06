@@ -1,0 +1,463 @@
+diff --git i/common/arg.cpp w/common/arg.cpp
+index 2669cacd6..9de219856 100644
+--- i/common/arg.cpp
++++ w/common/arg.cpp
+@@ -249,6 +249,14 @@ std::vector<std::string> common_arg::get_env() const {
+ //
+ 
+ // Helper function to parse tensor buffer override strings
++
++// custom gfx1200 build: the Vulkan GTT hostmem buffer type is not a registered
++// device, so -ot could never name it. Weak link — resolves only in builds with
++// the ggml-vulkan hostmem patch; other builds simply don't offer the type.
++#if defined(__GNUC__)
++extern "C" ggml_backend_buffer_type_t ggml_backend_vk_hostmem_buffer_type(size_t dev_num) __attribute__((weak));
++#endif
++
+ static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
+     ggml_backend_load_all();
+ 
+@@ -261,6 +269,19 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
+         }
+     }
+ 
++    if (ggml_backend_vk_hostmem_buffer_type) {
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            auto * dev = ggml_backend_dev_get(i);
++            if (std::string(ggml_backend_dev_name(dev)).rfind("Vulkan", 0) != 0) {
++                continue;
++            }
++            auto * hb = ggml_backend_vk_hostmem_buffer_type(i);
++            if (hb) {
++                buft_list[ggml_backend_buft_name(hb)] = hb;
++            }
++        }
++    }
++
+     for (const auto & override : string_split<std::string>(value, ',')) {
+         std::string::size_type pos = override.find('=');
+         if (pos == std::string::npos) {
+@@ -4156,6 +4177,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.n_max = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
++    add_opt(common_arg(
++        {"--spec-draft-ctx"}, "N",
++        string_format("size of the draft context per sequence, 0 = match the target context (default: %d)", params.speculative.draft.n_ctx),
++        [](common_params & params, int value) {
++            if (value < 0) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_ctx = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX"));
+     add_opt(common_arg(
+         {"--spec-draft-n-min"}, "N",
+         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+diff --git i/common/common.cpp w/common/common.cpp
+index d162a3880..a9e698f67 100644
+--- i/common/common.cpp
++++ w/common/common.cpp
+@@ -1309,6 +1309,10 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+         }
+         cparams_dft.n_rs_seq = 0;
++        // the draft may run with a smaller context than the target (--spec-draft-ctx)
++        if (params.speculative.draft.n_ctx > 0) {
++            cparams_dft.n_ctx = (uint32_t) params.speculative.draft.n_ctx;
++        }
+ 
+         const common_fit_extra_model extra = {
+             /*.path_model   =*/ params_dft.model.path.c_str(),
+diff --git i/common/common.h w/common/common.h
+index 63d0badd0..42eb980bc 100644
+--- i/common/common.h
++++ w/common/common.h
+@@ -331,6 +331,8 @@ struct common_params_speculative_draft {
+ 
+     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+ 
++    int32_t n_ctx = 0; // draft context size per sequence, 0 = match the target context
++
+     common_params_model mparams;
+ 
+     llama_context * ctx_tgt = nullptr;
+diff --git i/common/speculative.cpp w/common/speculative.cpp
+index 851a47b9a..f783de3d7 100644
+--- i/common/speculative.cpp
++++ w/common/speculative.cpp
+@@ -941,6 +941,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
+     uint32_t        target_layer_ids_n = 0;
+ 
++    // per-seq position offset when the draft context is smaller than the target
++    // context: draft positions are shifted down by this amount and positions
++    // that fall out of the draft window are dropped
++    std::vector<llama_pos> pos_offset;
++    std::vector<llama_pos> p_abs_last; // per-seq last injected absolute target position (restart detector)
++
+     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
+             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
+         : common_speculative_impl(type, n_seq, params.draft.n_max)
+@@ -951,6 +957,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         auto * ctx_dft = this->params.ctx_dft;
+         GGML_ASSERT(ctx_tgt && ctx_dft && "DFlash requires ctx_tgt and ctx_dft to be set");
+ 
++        pos_offset.assign(n_seq, 0);
++        p_abs_last.assign(n_seq, 0);
++
+         const llama_model * model_dft = llama_get_model(ctx_dft);
+         const llama_model * model_tgt = llama_get_model(ctx_tgt);
+ 
+@@ -1131,9 +1140,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+ 
++            // a sequence whose absolute positions dropped below what we already
++            // injected restarted (new conversation on the slot, or a rollback).
++            // The stored remap is bound to the old timeline: start the window
++            // over from zero or the stored positions go negative, which the
++            // batch validator rejects outright.
++            const llama_pos p_first_abs = batch_in.pos[i_batch_beg[seq_id]];
++            if (p_first_abs < p_abs_last[seq_id]) {
++                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
++                pos_offset[seq_id] = 0;
++            }
++            p_abs_last[seq_id] = batch_in.pos[i_batch_end[seq_id]];
++
+             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+ 
++                // when the draft context is smaller than the target context,
++                // slide the draft window. The draft's stored positions are
++                // target positions minus pos_offset, so a slide moves the
++                // coordinate origin: drop cells stored below the new origin
++                // (their absolute positions fell out of the window) and drop
++                // cells at or above the incoming chunk's first stored position
++                // (their stored spots collide with the new writes). The draft
++                // loses at most one ubatch of recent context per slide.
++                // Chunks are far smaller than the window, so a chunk never
++                // straddles the boundary.
++                const llama_pos p_last = batch_in.pos[i_batch_beg[seq_id] + offset + n_chunk - 1];
++                const int32_t dft_cap  = (int32_t) llama_n_ctx_seq(ctx_dft) - this->n_max - 4;
++                if (p_last - pos_offset[seq_id] >= dft_cap) {
++                    const llama_pos new_off   = (llama_pos) (p_last - dft_cap);
++                    const llama_pos inject_beg = (llama_pos) (batch_in.pos[i_batch_beg[seq_id] + offset] - new_off);
++                    llama_memory_t mem_dft = llama_get_memory(ctx_dft);
++                    llama_memory_seq_rm(mem_dft, seq_id, -1, new_off - pos_offset[seq_id]);
++                    llama_memory_seq_rm(mem_dft, seq_id, inject_beg, -1);
++                    pos_offset[seq_id] = new_off;
++                }
++
+                 // gather target features per extract layer; the fused decode encodes and
+                 // injects them into the K/V cache at the target positions
+                 batch_inject.n_tokens = n_chunk;
+@@ -1151,10 +1193,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+                 for (int32_t i = 0; i < n_chunk; ++i) {
+                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+-                    batch_inject.pos[i] = p;
++                    batch_inject.pos[i] = p - pos_offset[seq_id];
+                     if (is_mrope) {
+-                        batch_inject.pos[1 * n_chunk + i] = p;
+-                        batch_inject.pos[2 * n_chunk + i] = p;
++                        batch_inject.pos[1 * n_chunk + i] = p - pos_offset[seq_id];
++                        batch_inject.pos[2 * n_chunk + i] = p - pos_offset[seq_id];
+                         batch_inject.pos[3 * n_chunk + i] = 0;
+                     }
+                     batch_inject.n_seq_id[i]  = 1;
+@@ -1189,9 +1231,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 continue;
+             }
+ 
++            // trim the draft cache to the accepted prefix in STORED coordinates;
++            // the framework's own trim runs in absolute space and cannot see the remap,
++            // leaving stale cells above the next noise block
++            if (pos_offset[seq_id] > 0) {
++                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos)(dp.n_past - pos_offset[seq_id]), -1);
++            }
++
+             common_sampler_reset(smpls[seq_id].get());
+ 
+-            const int32_t n = (int32_t) dp.n_past;
++            const int32_t n = (int32_t) dp.n_past - pos_offset[seq_id];
+ 
+             const int32_t n_draft = params.n_max;
+ 
+@@ -2529,8 +2578,10 @@ common_speculative_init_result::common_speculative_init_result(
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+     }
+ 
+-    // the draft context holds as many tokens per sequence as the target context
+-    cparams.n_ctx = llama_n_ctx(ctx_tgt);
++    // the draft context holds as many tokens per sequence as the target context,
++    // unless a smaller draft context was requested (--spec-draft-ctx)
++    cparams.n_ctx = params.speculative.draft.n_ctx > 0 ?
++        (uint32_t) params.speculative.draft.n_ctx : llama_n_ctx(ctx_tgt);
+ 
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+     //       the extra memory for small models is likely negligible?
+diff --git i/ggml/include/ggml-vulkan.h w/ggml/include/ggml-vulkan.h
+index ed5ea5f79..26a66ae38 100644
+--- i/ggml/include/ggml-vulkan.h
++++ w/ggml/include/ggml-vulkan.h
+@@ -19,6 +19,9 @@ GGML_BACKEND_API void ggml_backend_vk_get_device_description(int device, char *
+ GGML_BACKEND_API void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
+ 
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
++// system RAM (GTT) the GPU addresses directly; buffers are never device-local,
++// so allocation fails instead of consuming VRAM
++GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_hostmem_buffer_type(size_t dev_num);
+ // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
+ 
+diff --git i/ggml/src/ggml-vulkan/ggml-vulkan.cpp w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a04a6b27a..31a5bdb54 100644
+--- i/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -381,6 +381,26 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
+     /* .is_host          = */ NULL,
+ };
+ 
++// hostmem buffer type: system RAM (GTT) the GPU addresses directly, never
++// device-local memory; used for KV caches that must stay in host memory
++// without forcing attention onto the CPU (LLAMA_KV_HOSTMEM=1), and for
++// -ot tensor overrides under its own name "Vulkan-GTT" so large weight
++// tensors can be pinned to GTT while attention/kernels stay on the GPU.
++static ggml_backend_buffer_t ggml_backend_vk_hostmem_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
++
++static const char * ggml_backend_vk_hostmem_buffer_type_name(ggml_backend_buffer_type_t buft) {
++    return "Vulkan-GTT";
++}
++
++static ggml_backend_buffer_type_i ggml_backend_vk_hostmem_buffer_type_interface = {
++    /* .get_name         = */ ggml_backend_vk_hostmem_buffer_type_name,
++    /* .alloc_buffer     = */ ggml_backend_vk_hostmem_buffer_type_alloc_buffer,
++    /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
++    /* .get_max_size     = */ ggml_backend_vk_buffer_type_get_max_size,
++    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
++    /* .is_host          = */ NULL,
++};
++
+ class vk_memory_logger;
+ class vk_perf_logger;
+ static void ggml_vk_destroy_buffer(vk_buffer& buf);
+@@ -1138,6 +1158,7 @@ struct vk_device_struct {
+     vk_buffer sync_staging;
+ 
+     ggml_backend_buffer_type buffer_type;
++    ggml_backend_buffer_type hostmem_buffer_type; // system RAM the GPU addresses directly (never device-local)
+ 
+     bool disable_fusion;
+     bool disable_host_visible_vidmem;
+@@ -3469,13 +3490,14 @@ static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
+     }
+ }
+ 
+-static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags) {
++static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDeviceMemoryProperties* mem_props, vk::MemoryRequirements* mem_req, vk::MemoryPropertyFlags flags, vk::MemoryPropertyFlags exclude_flags = {}) {
+     std::vector<uint32_t> indices;
+ 
+     for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
+         vk::MemoryType memory_type = mem_props->memoryTypes[i];
+         if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
+             (flags & memory_type.propertyFlags) == flags &&
++            (exclude_flags == vk::MemoryPropertyFlags(0) || !(memory_type.propertyFlags & exclude_flags)) &&
+             mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
+             indices.push_back(i);
+         }
+@@ -3484,7 +3506,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
+ }
+ 
+ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
+-                                       void *import_ptr = nullptr) {
++                                       void *import_ptr = nullptr, vk::MemoryPropertyFlags exclude_flags = vk::MemoryPropertyFlags(0)) {
+     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
+     if (size > device->max_buffer_size) {
+         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+@@ -3580,7 +3602,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
+         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
+             const auto & req_flags = *it;
+ 
+-            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
++            const std::vector<uint32_t> memory_type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags, exclude_flags);
+ 
+             if (memory_type_indices.empty()) {
+                 continue;
+@@ -7182,6 +7204,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+         };
+ 
++        device->hostmem_buffer_type = {
++            /* .iface    = */ ggml_backend_vk_hostmem_buffer_type_interface,
++            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
++            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "-HOSTMEM", device },
++        };
++
+         device->fence = device->device.createFence({});
+ 
+         device->idx = idx;
+@@ -16376,8 +16404,11 @@ static void ggml_vk_get_device_description(int device, char * description, size_
+ 
+ // device backend
+ 
++// hostmem buffers share the vk buffer interface; accept both name getters so
++// the compute path (set_tensor, copies, graph exec) treats GTT buffers as vk
+ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
+-    return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
++    return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name ||
++           buffer->buft->iface.get_name == ggml_backend_vk_hostmem_buffer_type_name;
+ }
+ 
+ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+@@ -16558,6 +16589,44 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
+     return &dev->buffer_type;
+ }
+ 
++// hostmem (GTT) buffer type
++
++static vk_buffer ggml_vk_create_buffer_hostmem(vk_device& device, size_t size) {
++    // host-visible system RAM (GTT) the GPU reads and writes directly. Must NOT
++    // be device-local: falling back to BAR would silently consume VRAM, so
++    // device-local is excluded and allocation fails hard instead.
++    return ggml_vk_create_buffer(device, size,
++        { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent },
++        nullptr,
++        vk::MemoryPropertyFlagBits::eDeviceLocal);
++}
++
++static ggml_backend_buffer_t ggml_backend_vk_hostmem_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    VK_LOG_MEMORY("ggml_backend_vk_hostmem_buffer_type_alloc_buffer(" << size << ")");
++    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
++
++    vk_buffer dev_buffer = nullptr;
++    try {
++        dev_buffer = ggml_vk_create_buffer_hostmem(ctx->device, size);
++    } catch (const vk::SystemError& e) {
++        return nullptr;
++    }
++
++    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
++
++    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++}
++
++ggml_backend_buffer_type_t ggml_backend_vk_hostmem_buffer_type(size_t dev_num) {
++    ggml_vk_instance_init();
++
++    VK_LOG_DEBUG("ggml_backend_vk_hostmem_buffer_type(" << dev_num << ")");
++
++    vk_device dev = ggml_vk_get_device(dev_num);
++
++    return &dev->hostmem_buffer_type;
++}
++
+ // host buffer type
+ 
+ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+@@ -19187,7 +19256,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+ }
+ 
+ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+-    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
++    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name &&
++        buft->iface.get_name != ggml_backend_vk_hostmem_buffer_type_name) {
+         return false;
+     }
+ 
+diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
+index 274a62643..4abfce3d8 100644
+--- i/src/llama-graph.cpp
++++ w/src/llama-graph.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <numeric>
+ #include <sstream>
+@@ -2661,8 +2662,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+ 
+         if (!cparams.offload_kqv) {
+-            // all nodes between the KV store and the attention output are run on the CPU
+-            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
++            // all nodes between the KV store and the attention output are run on
++            // the CPU. LLAMA_KV_GPU_ATTN=1 keeps attention on the GPU instead, so
++            // the KV tensors are copied across the bus per pass; this wins when
++            // the GPU is much faster at attention than the CPU.
++            static const bool kv_gpu_attn = getenv("LLAMA_KV_GPU_ATTN") != nullptr;
++            if (!kv_gpu_attn) {
++                ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
++            }
+         }
+     }
+ 
+diff --git i/src/llama-kv-cache.cpp w/src/llama-kv-cache.cpp
+index a342ee119..a7f6a6fd5 100644
+--- i/src/llama-kv-cache.cpp
++++ w/src/llama-kv-cache.cpp
+@@ -8,12 +8,15 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
+ #include <unordered_map>
+ 
++#include "ggml-vulkan.h"
++
+ static bool ggml_is_power_of_2(int n) {
+     return (n & (n - 1)) == 0;
+ }
+@@ -215,9 +218,26 @@ llama_kv_cache::llama_kv_cache(
+ 
+         if (offload) {
+             auto * dev = model.dev_layer(il);
+-            buft = ggml_backend_dev_buffer_type(dev);
+ 
+-            dev_name = ggml_backend_dev_name(dev);
++            // LLAMA_KV_HOSTMEM=1: keep the KV bytes in system RAM (Vulkan GTT)
++            // while attention still runs on the GPU — the GPU reads/writes the
++            // cache over the bus directly and no VRAM is consumed
++            static const bool kv_hostmem = getenv("LLAMA_KV_HOSTMEM") != nullptr;
++            if (kv_hostmem && strncmp(ggml_backend_dev_name(dev), "Vulkan", 6) == 0) {
++                ggml_backend_reg_t vk_reg = ggml_backend_vk_reg();
++                size_t vk_idx = 0;
++                for (size_t i = 0; i < ggml_backend_reg_dev_count(vk_reg); i++) {
++                    if (ggml_backend_reg_dev_get(vk_reg, i) == dev) {
++                        vk_idx = i;
++                        break;
++                    }
++                }
++                buft = ggml_backend_vk_hostmem_buffer_type(vk_idx);
++                dev_name = "Vulkan-HOSTMEM";
++            } else {
++                buft = ggml_backend_dev_buffer_type(dev);
++                dev_name = ggml_backend_dev_name(dev);
++            }
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+diff --git i/tools/server/server-context.cpp w/tools/server/server-context.cpp
+index f78cfb36d..f32556aa5 100644
+--- i/tools/server/server-context.cpp
++++ w/tools/server/server-context.cpp
+@@ -1124,6 +1124,13 @@ private:
+ 
+             {
+                 common_params params_dft = common_base_params_to_speculative(params_base);
++                // The draft is a ~1GB model: its KV cache always fits on the
++                // GPU, even when the target runs with --no-kv-offload and a
++                // 200k host-resident KV. Inheriting the target's no_kv_offload
++                // makes every draft pass pay host-memory attention, which
++                // turns speculative decoding into a net loss on long-context
++                // host-KV setups.
++                params_dft.no_kv_offload = false;
+ 
+                 // progress callback
+                 params_dft.load_progress_callback           = load_progress_callback;

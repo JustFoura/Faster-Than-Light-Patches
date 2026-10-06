@@ -1,0 +1,62 @@
+From 15a2f2f494cad6da57ac3bcfa8e89e4aaeeb717b Mon Sep 17 00:00:00 2001
+From: JustFoura <JustFoura.dev@proton.me>
+Date: Tue, 29 Sep 2026 20:56:07 +1300
+Subject: [PATCH 11/18] Covered flag: up/down skip their preads when the gate
+ op's merged job made the layer's miss set resident
+
+Removes the ~2.2-2.5 ms/layer of cache-hit pread waits (up/down re-preading
+what gate's job already read): gate resets the flag per ubatch, sets it when
+its job merges a registered sibling, and later ops of the layer publish NULL
+(their threads still advance the generation, just with no job to wait on).
+First pass after load falls back to own-tensor jobs until the registry
+converges.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 26d80113f..a3e06f4fe 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2336,6 +2336,7 @@ static void ggml_compute_forward_mul_mat_id(
+         struct sib_ent { const void * base; size_t nb02; int has; };
+         #define GGML_MOE_SIB_LAYERS 64
+         static struct sib_ent g_moe_sib[GGML_MOE_SIB_LAYERS][3];
++        static int g_moe_sib_covered[GGML_MOE_SIB_LAYERS];
+         int sib_il = -1, sib_kind = -1;
+         {
+             const char * nm = src0->name;
+@@ -2347,12 +2348,21 @@ static void ggml_compute_forward_mul_mat_id(
+                 else if (strstr(nm, "ffn_down_exps")) sib_kind = 2;
+             }
+             if (sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind >= 0) {
++                if (sib_kind == 0) {
++                    // the gate op leads the layer: its merged job (when the
++                    // siblings are registered) makes every slice of this
++                    // ubatch's miss set resident, so up/down skip their own
++                    // preads entirely. Reset per ubatch here.
++                    g_moe_sib_covered[sib_il] = 0;
++                }
+                 g_moe_sib[sib_il][sib_kind].base = src0->data;
+                 g_moe_sib[sib_il][sib_kind].nb02 = (size_t) nb02;
+                 g_moe_sib[sib_il][sib_kind].has = 1;
+             }
+         }
+-        if (moe_fanout_n > 0) {
++        const int sib_covered = sib_il >= 0 && sib_il < GGML_MOE_SIB_LAYERS && sib_kind > 0
++            ? g_moe_sib_covered[sib_il] : 0;
++        if (moe_fanout_n > 0 && !sib_covered) {
+             sl = malloc(sizeof(struct ggml_moe_fanout_slice) * (size_t) n_as * 3);
+             if (sl) {
+                 for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+@@ -2372,6 +2382,7 @@ static void ggml_compute_forward_mul_mat_id(
+                         if (k == sib_kind || !g_moe_sib[sib_il][k].has) {
+                             continue;
+                         }
++                        g_moe_sib_covered[sib_il] = 1;
+                         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                             if (matrix_row_counts[cur_a] == 0) {
+                                 continue;
+-- 
+2.55.0
+

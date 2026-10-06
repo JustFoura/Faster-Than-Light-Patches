@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Qwen3.8 Flash-Next daily launcher — the tuned 2026-10-01 stack.
+#
+# Requires a binary built from patches/llama-cpp/unified-0.4.0-mtp-cache.patch:
+# this script passes --moe-expert-cache and exports the LLAMA_MOE_* recipe, and
+# the foundation-only patch has none of them.
+#
+# NOTE on defaults: FLASH_MOE_CACHE_SLOTS defaults to 88, which ABORTS at
+# ctx 200000 on a 16 GB card (RADV cannot commit the q8 KV plus an 88-slot
+# expert cache). Use 64 — see the repo README, "Status". 64 is also what the
+# decode numbers in the README are NOT measured at: ~7 t/s was measured with 88
+# slots, and 48 slots measured ~3.2-3.9 t/s.
+#
+# Env overrides: LLAMA_SERVER_BIN, FLASH_MODEL, FLASH_CTX_SIZE (default
+# 200000; q8 KV for this arch is ~2.7 GB in GTT hostmem — RAM, not VRAM),
+# FLASH_MOE_CACHE_SLOTS (see above — use 64), FLASH_MOE_CACHE_INSERTS
+# (0 = bench-final; try 2 in a real drifting conversation and compare),
+# FLASH_UBATCH_SIZE, FLASH_BATCH_SIZE, FLASH_FANOUT (24; best of a
+# 12/24/32 sweep that sits inside the measured run-to-run band),
+# FLASH_THREADS, FLASH_THREADS_BATCH, FLASH_SPEC_TYPE, FLASH_PORT (1235),
+# FLASH_MOE_PROFILE, FLASH_MEM_FLOOR_GB.
+#
+# UBATCH/BATCH (10-01 evening, revised after the freeze): the scheduler
+# re-copies all ~77 GB of expert weights from the mmap into VRAM on EVERY
+# prompt ubatch pass, so ubatch 512 made a 4k-token agent prompt read ~9x
+# the whole expert set (measured live: 4,397 tok prefilled at 10.4 t/s).
+# One wide pass reads the 77 GB once (~170+ t/s at ctx<=16k). At 200k ctx
+# the default width is 4096 — see the memory-safety block below; decode
+# passes are 1 token wide and unaffected by any of this.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+SERVER="${LLAMA_SERVER_BIN:-$HOME/build/llama.cpp-unified/build-vulkan/bin/llama-server}"
+MODEL="${FLASH_MODEL:-$PROJECT_ROOT/app/models/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-nocow/Qwen3.8-Flash-Next-Uncensored.i1-IQ4_XS.gguf}"
+CTX_SIZE="${FLASH_CTX_SIZE:-200000}"
+MOE_CACHE_SLOTS="${FLASH_MOE_CACHE_SLOTS:-88}"
+MOE_CACHE_INSERTS="${FLASH_MOE_CACHE_INSERTS:-0}"
+UBATCH_SIZE="${FLASH_UBATCH_SIZE:-0}"
+BATCH_SIZE="${FLASH_BATCH_SIZE:-0}"
+
+# Memory safety (added after the 2026-10-01 desktop freeze): a wide ubatch at
+# 200k ctx stacks the q8 KV (~2.7 GB GTT hostmem) on top of 16384-wide graph
+# buffers with --fit off — that combination exhausted RAM + zram and froze the
+# desktop. Defaults now: ctx > 32768 -> ubatch 4096 (one pass for any prompt
+# up to 4096 tokens, graph buffers a quarter of 16384's), else 16384. The
+# preflight refuses to start when MemAvailable is under the floor instead of
+# letting the kernel thrash.
+avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+FLOOR_GB="${FLASH_MEM_FLOOR_GB:-6}"
+if (( avail_kb < FLOOR_GB * 1024 * 1024 )); then
+    printf 'Refusing to start: MemAvailable %d MiB < %d GB floor (KV + graph buffers + desktop).\n' \
+        "$(( avail_kb / 1024 ))" "$FLOOR_GB" >&2
+    printf 'Close something, or lower FLASH_MEM_FLOOR_GB at your own risk.\n' >&2
+    exit 1
+fi
+if (( UBATCH_SIZE == 0 )); then
+    if (( CTX_SIZE > 32768 )); then UBATCH_SIZE=4096; else UBATCH_SIZE=16384; fi
+fi
+if (( BATCH_SIZE == 0 )); then
+    BATCH_SIZE=$UBATCH_SIZE
+fi
+FANOUT="${FLASH_FANOUT:-24}"
+PORT="${FLASH_PORT:-1235}"
+PROFILE="${FLASH_MOE_PROFILE:-/tmp/moe_routes_decode.log}"
+
+if [[ ! -x "$SERVER" ]]; then
+    printf 'llama-server binary is not executable: %s\n' "$SERVER" >&2
+    exit 1
+fi
+if [[ ! -f "$MODEL" ]]; then
+    printf 'Qwen3.8 Flash-Next GGUF not found: %s\n' "$MODEL" >&2
+    exit 1
+fi
+if [ ! -f "$PROFILE" ]; then
+    # Route capture from the 09-27 session (committed); restores after reboot.
+    gunzip -c "$PROJECT_ROOT/docs/bench-results-2026-09-27/moe-routes-decode-256t.log.gz" > "$PROFILE"
+fi
+
+export LD_LIBRARY_PATH="$(dirname -- "$SERVER")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LLAMA_KV_HOSTMEM=1
+# Phase recipe of record: decode/verify reads experts exactly (MADV_RANDOM +
+# pread) while prompt passes keep readahead; persistent fanout pool.
+export LLAMA_MOE_MADV_RANDOM=decode
+export LLAMA_MOE_PREAD=1
+export LLAMA_MOE_FANOUT="$FANOUT"
+export LLAMA_MOE_PROFILE="$PROFILE"
+
+THREAD_ARGS=()
+if [[ -n "${FLASH_THREADS:-}" ]]; then
+    THREAD_ARGS+=(--threads "$FLASH_THREADS" --threads-batch "${FLASH_THREADS_BATCH:-$FLASH_THREADS}")
+fi
+SPEC_ARGS=()
+if [[ -n "${FLASH_SPEC_TYPE:-}" ]]; then
+    SPEC_ARGS+=(--spec-type "$FLASH_SPEC_TYPE")
+fi
+
+exec "$SERVER" "${THREAD_ARGS[@]}" "${SPEC_ARGS[@]}" \
+    --model "$MODEL" \
+    --gpu-layers all \
+    --cpu-moe \
+    --load-mode mmap \
+    --fit off \
+    --ctx-size "$CTX_SIZE" \
+    --parallel 1 \
+    --batch-size "$BATCH_SIZE" \
+    --ubatch-size "$UBATCH_SIZE" \
+    --flash-attn on \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
+    --moe-expert-cache "$MOE_CACHE_SLOTS" \
+    --moe-expert-cache-inserts "$MOE_CACHE_INSERTS" \
+    --host 127.0.0.1 \
+    --port "$PORT" \
+    --no-webui

@@ -1,0 +1,91 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -37,6 +37,10 @@
+ #include <signal.h>
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
++#endif
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
+ #endif
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -1468,6 +1472,62 @@
+     int32_t i2;
+ };
+ 
++
++// Optional Linux read-ahead for expert matrices selected by the current graph.
++// This is an immediate demand hint, not a learned route profile or placement policy.
++static bool ggml_cpu_mmid_demand_prefetch_enabled(void) {
++#if defined(__linux__)
++    const char * value = getenv("GGML_MOE_MMAP_WILLNEED");
++    return value != NULL && value[0] == '1' && value[1] == '\0';
++#else
++    return false;
++#endif
++}
++
++static void ggml_cpu_mmid_demand_prefetch(
++        const struct ggml_tensor * src0,
++        const int64_t * matrix_row_counts,
++        const int64_t n_experts) {
++#if defined(__linux__)
++    if (!ggml_cpu_mmid_demand_prefetch_enabled()) {
++        return;
++    }
++
++    const long page_size = sysconf(_SC_PAGESIZE);
++    if (page_size <= 0) {
++        return;
++    }
++
++    // Coalesce adjacent selected experts to keep syscall overhead bounded.
++    for (int64_t first = 0; first < n_experts;) {
++        if (matrix_row_counts[first] == 0) {
++            ++first;
++            continue;
++        }
++
++        int64_t end = first + 1;
++        while (end < n_experts && matrix_row_counts[end] != 0) {
++            ++end;
++        }
++
++        const uintptr_t begin_addr = (uintptr_t) src0->data + first * src0->nb[2];
++        const uintptr_t end_addr = (uintptr_t) src0->data + end * src0->nb[2];
++        const uintptr_t page_begin = begin_addr - begin_addr % (uintptr_t) page_size;
++        const uintptr_t page_end = ((end_addr + (uintptr_t) page_size - 1) / (uintptr_t) page_size) * (uintptr_t) page_size;
++
++        if (page_end > page_begin) {
++            (void) madvise((void *) page_begin, page_end - page_begin, MADV_WILLNEED);
++        }
++
++        first = end;
++    }
++#else
++    (void) src0;
++    (void) matrix_row_counts;
++    (void) n_experts;
++#endif
++}
++
+ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     struct ggml_tensor * dst,
+     const struct ggml_tensor * src0,
+@@ -1660,6 +1720,13 @@
+         *current_chunk_ctr = nth;
+     }
+ 
++    ggml_barrier(params->threadpool);
++
++    // Route IDs are final for this graph node; hint the page cache for just
++    // those experts before their matrix products start.
++    if (ith == 0) {
++        ggml_cpu_mmid_demand_prefetch(src0, matrix_row_counts, n_as);
++    }
+     ggml_barrier(params->threadpool);
+ 
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
